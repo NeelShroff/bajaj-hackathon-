@@ -1,0 +1,22 @@
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environment
+venv/
+
+# Environment variables
+
+# FAISS index files
+data/faiss_index.faiss
+data/faiss_index.pkl
+data/processed/
+
+# Debug/temporary files
+debug_pdf.py
+*.log
+
+# IDE files
+.vscode/
+.idea/
