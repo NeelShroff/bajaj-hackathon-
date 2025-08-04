@@ -86,7 +86,7 @@ class RetrievalSystem:
 
     async def retrieve_and_generate_answer_async(self, query: str, embeddings_manager: EmbeddingsManager) -> Tuple[str, List[str], float]:
         try:
-            relevant_chunks = await asyncio.to_thread(self.retrieve_relevant_chunks, query, embeddings_manager, k=6)
+            relevant_chunks = await asyncio.to_thread(self.retrieve_relevant_chunks, query, embeddings_manager, k=8)
 
             if not relevant_chunks:
                 return "The policy document does not contain sufficient information to answer this question.", [], 0.0
@@ -119,7 +119,7 @@ Final Answer:
                 client.chat.completions.create,
                 model=config.OPENAI_MODEL,
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.2,
+                temperature=0.1,
                 max_tokens=180,
                 top_p=0.9
             )
