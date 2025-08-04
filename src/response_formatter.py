@@ -12,31 +12,26 @@ class ResponseFormatter:
     
     def __init__(self):
         self.start_time = None
-        
+    
     def start_timing(self):
         """Start timing the response generation."""
         self.start_time = time.time()
     
     def format_response(self, query: str, query_info: Dict[str, Any], 
-                       decision_result: DecisionResult, 
-                       retrieved_clauses: Dict[str, List[tuple]],
-                       document_source: str = None) -> Dict[str, Any]:
+                        decision_result: DecisionResult, 
+                        retrieved_clauses: Dict[str, List[tuple]],
+                        document_source: str = None) -> Dict[str, Any]:
         """Format the complete response with all components."""
         self.start_timing()
         
-        # Calculate processing time
         processing_time = time.time() - self.start_time if self.start_time else 0
         
-        # Format amounts
         amounts = self._format_amounts(decision_result.amounts)
         
-        # Format justification
         justification = self._format_justification(decision_result, retrieved_clauses)
         
-        # Format metadata
         metadata = self._format_metadata(processing_time, document_source, query_info)
         
-        # Build response
         response = {
             "query": query,
             "decision": decision_result.decision,
@@ -46,7 +41,6 @@ class ResponseFormatter:
             "metadata": metadata
         }
         
-        # Add query analysis if available
         if query_info.get('entities'):
             response["query_analysis"] = {
                 "extracted_entities": query_info['entities'],
@@ -65,14 +59,12 @@ class ResponseFormatter:
                 "currency": "INR"
             }
         
-        # Ensure all required fields are present
         formatted_amounts = {
             "covered_amount": amounts.get('covered_amount', amounts.get('amount', 0)),
             "patient_responsibility": amounts.get('patient_responsibility', 0),
             "currency": amounts.get('currency', 'INR')
         }
         
-        # Add additional amount fields if available
         if 'maximum' in amounts:
             formatted_amounts['maximum_limit'] = amounts['maximum']
         if 'sum_insured' in amounts:
@@ -83,20 +75,18 @@ class ResponseFormatter:
         return formatted_amounts
     
     def _format_justification(self, decision_result: DecisionResult, 
-                            retrieved_clauses: Dict[str, List[tuple]]) -> Dict[str, Any]:
+                             retrieved_clauses: Dict[str, List[tuple]]) -> Dict[str, Any]:
         """Format the justification section."""
         justification = {
             "reasoning": decision_result.reasoning,
             "applicable_clauses": self._format_applicable_clauses(decision_result.applicable_clauses),
             "conditions": decision_result.conditions,
-            "exclusions_checked": decision_result.exclusions_checked
+            "exclusions_checked": decision_result.exclusions
         }
         
-        # Add waiting periods if applicable
         if decision_result.waiting_periods:
             justification["waiting_periods"] = decision_result.waiting_periods
         
-        # Add retrieval quality information
         retrieval_quality = self._assess_retrieval_quality(retrieved_clauses)
         if retrieval_quality:
             justification["retrieval_quality"] = retrieval_quality
@@ -129,7 +119,6 @@ class ResponseFormatter:
                 "suggestions": ["Check document indexing", "Verify query relevance"]
             }
         
-        # Calculate average relevance scores
         all_scores = []
         for clauses in retrieved_clauses.values():
             all_scores.extend([score for _, score in clauses])
@@ -137,7 +126,6 @@ class ResponseFormatter:
         avg_score = sum(all_scores) / len(all_scores) if all_scores else 0
         max_score = max(all_scores) if all_scores else 0
         
-        # Assess quality
         quality_score = (avg_score + max_score) / 2
         
         issues = []
@@ -161,18 +149,16 @@ class ResponseFormatter:
         }
     
     def _format_metadata(self, processing_time: float, document_source: str, 
-                        query_info: Dict[str, Any]) -> Dict[str, Any]:
+                         query_info: Dict[str, Any]) -> Dict[str, Any]:
         """Format metadata information."""
         metadata = {
             "processing_time": f"{processing_time:.1f}s",
             "document_source": document_source or "unknown"
         }
         
-        # Add token usage if available
         if query_info.get('processing_metadata', {}).get('tokens_used'):
             metadata["tokens_used"] = query_info['processing_metadata']['tokens_used']
         
-        # Add processing method
         metadata["processing_method"] = query_info.get('processing_metadata', {}).get('method', 'hybrid')
         
         return metadata
@@ -207,7 +193,7 @@ class ResponseFormatter:
         }
     
     def format_partial_response(self, query: str, partial_data: Dict[str, Any], 
-                              missing_components: List[str]) -> Dict[str, Any]:
+                                missing_components: List[str]) -> Dict[str, Any]:
         """Format partial response when some components are missing."""
         response = {
             "query": query,
@@ -262,4 +248,4 @@ class ResponseFormatter:
             "index_stats": system_status.get('index_stats', {}),
             "document_count": system_status.get('document_count', 0),
             "version": "1.0.0"
-        } 
+        }

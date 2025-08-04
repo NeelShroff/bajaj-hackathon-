@@ -32,7 +32,6 @@ class QueryProcessor:
     def __init__(self):
         self.client = OpenAI(api_key=config.OPENAI_API_KEY)
         
-        # Common patterns for entity extraction
         self.age_pattern = r'(\d{1,3})(?:M|F|Male|Female|MALE|FEMALE)'
         self.gender_pattern = r'(\d{1,3})(M|F|Male|Female|MALE|FEMALE)'
         self.location_pattern = r'\b(Mumbai|Delhi|Bangalore|Chennai|Kolkata|Pune|Hyderabad|Ahmedabad|Jaipur|Lucknow|Kanpur|Nagpur|Indore|Thane|Bhopal|Visakhapatnam|Pimpri-Chinchwad|Patna|Vadodara|Ghaziabad|Ludhiana|Agra|Nashik|Faridabad|Meerut|Rajkot|Kalyan-Dombivali|Vasai-Virar|Varanasi|Srinagar|Aurangabad|Dhanbad|Amritsar|Allahabad|Ranchi|Howrah|Coimbatore|Jabalpur|Gwalior|Vijayawada|Jodhpur|Madurai|Raipur|Kota|Guwahati|Chandigarh|Solapur|Tiruchirappalli|Bareilly|Moradabad|Mysore|Tiruppur|Gurgaon|Aligarh|Jalandhar|Bhubaneswar|Salem|Warangal|Guntur|Bhiwandi|Saharanpur|Gorakhpur|Bikaner|Amravati|Noida|Jamshedpur|Bhilai|Cuttack|Firozabad|Kochi|Nellore|Bhavnagar|Dehradun|Durgapur|Asansol|Rourkela|Nanded|Kolhapur|Ajmer|Akola|Gulbarga|Jamnagar|Ujjain|Loni|Siliguri|Jhansi|Ulhasnagar|Jammu|Sangli-Miraj|Mangalore|Erode|Belgaum|Ambattur|Tirunelveli|Malegaon|Gaya|Jalgaon|Udaipur|Maheshtala|Tirupur|Davanagere|Kozhikode|Kurnool|Rajpur|Sonarpur|Bokaro|South|Dum|Dum|Durg|Raj|Nagar|Bihar|Sharif|Panihati|Satara|Bijapur|Brahmapur|Shahjahanpur|Bidar|Gandhidham|Baranagar|Tiruvottiyur|Puducherry|Sikar|Thrissur|Alwar|Bahraich|Phusro|Vellore|Mehsana|Raebareli|Chittoor|Gwalior|Bhilwara|Gandhinagar|Bharatpur|Sikar|Panipat|Fatehpur|Budhana|Okara|Sanand|Tonk|Gangtok|Faizabad|Muktsar|Khanna|Yavatmal|Dhule|Korba|Bokaro|Steel|City|Raj|Nagar|Bihar|Sharif|Panihati|Satara|Bijapur|Brahmapur|Shahjahanpur|Bidar|Gandhidham|Baranagar|Tiruvottiyur|Puducherry|Sikar|Thrissur|Alwar|Bahraich|Phusro|Vellore|Mehsana|Raebareli|Chittoor|Gwalior|Bhilwara|Gandhinagar|Bharatpur|Sikar|Panipat|Fatehpur|Budhana|Okara|Sanand|Tonk|Gangtok|Faizabad|Muktsar|Khanna|Yavatmal|Dhule|Korba|Bokaro|Steel|City)\b'
@@ -44,24 +43,20 @@ class QueryProcessor:
         query_lower = query.lower()
         entities = QueryEntities()
         
-        # Extract age and gender
         age_gender_match = re.search(self.gender_pattern, query, re.IGNORECASE)
         if age_gender_match:
             entities.age = int(age_gender_match.group(1))
             gender = age_gender_match.group(2).upper()
             entities.gender = 'male' if gender in ['M', 'MALE'] else 'female'
         
-        # Extract location
         location_match = re.search(self.location_pattern, query, re.IGNORECASE)
         if location_match:
             entities.location = location_match.group(1)
         
-        # Extract policy duration
         duration_match = re.search(self.duration_pattern, query_lower)
         if duration_match:
             entities.policy_duration = f"{duration_match.group(1)} {duration_match.group(2)}s"
         
-        # Extract amounts
         amount_matches = re.findall(self.amount_pattern, query, re.IGNORECASE)
         for amount_str in amount_matches:
             try:
@@ -70,20 +65,16 @@ class QueryProcessor:
             except ValueError:
                 continue
         
-        # Extract procedure/treatment
         entities.procedure = self._extract_procedure(query)
         
-        # Determine query type
         entities.query_type = self._determine_query_type(query)
         
-        # Extract conditions
         entities.conditions = self._extract_conditions(query)
         
         return entities
     
     def _extract_procedure(self, query: str) -> Optional[str]:
         """Extract medical procedure or treatment from query."""
-        # Common medical procedures
         procedures = [
             'knee surgery', 'heart surgery', 'dental treatment', 'maternity',
             'hospitalization', 'emergency', 'accident', 'pre-existing',
@@ -122,7 +113,6 @@ class QueryProcessor:
         conditions = []
         query_lower = query.lower()
         
-        # Common conditions
         condition_keywords = [
             'emergency', 'accident', 'pre-existing', 'chronic',
             'acute', 'elective', 'planned', 'unplanned',
@@ -165,14 +155,12 @@ class QueryProcessor:
                 max_tokens=500
             )
             
-            # Parse JSON response
             import json
             result = json.loads(response.choices[0].message.content)
             return result
             
         except Exception as e:
             logger.error(f"Error enhancing query with LLM: {e}")
-            # Fallback to rule-based extraction
             entities = self.extract_entities(query)
             return {
                 "age": entities.age,
@@ -190,7 +178,6 @@ class QueryProcessor:
         """Create multiple search queries for better retrieval."""
         queries = []
         
-        # Base query with all entities
         base_query_parts = []
         if entities.procedure:
             base_query_parts.append(entities.procedure)
@@ -204,20 +191,16 @@ class QueryProcessor:
         if base_query_parts:
             queries.append(" ".join(base_query_parts))
         
-        # Specific coverage query
         if entities.procedure:
             queries.append(f"coverage {entities.procedure}")
             queries.append(f"benefits {entities.procedure}")
         
-        # Exclusion query
         if entities.procedure:
             queries.append(f"exclusions {entities.procedure}")
         
-        # Waiting period query
         if entities.procedure:
             queries.append(f"waiting period {entities.procedure}")
         
-        # Amount/limit query
         if entities.procedure:
             queries.append(f"amount limit {entities.procedure}")
             queries.append(f"maximum coverage {entities.procedure}")
@@ -228,13 +211,10 @@ class QueryProcessor:
         """Main method to process a query and return structured information."""
         logger.info(f"Processing query: {query}")
         
-        # Extract entities using rule-based approach
         entities = self.extract_entities(query)
         
-        # Enhance with LLM if needed
         enhanced_result = self.enhance_query_with_llm(query)
         
-        # Create search queries
         search_queries = self.create_search_queries(entities)
         
         return {
@@ -255,4 +235,4 @@ class QueryProcessor:
                 "method": "hybrid",
                 "confidence": enhanced_result.get("confidence", 0.7)
             }
-        } 
+        }

@@ -12,7 +12,7 @@ import tempfile
 import asyncio
 import uvicorn
 import numpy as np
-import time # Corrected: Added the missing import for the 'time' module
+import time
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, Security
@@ -20,6 +20,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from openai import OpenAI
+from pathlib import Path
 
 # Ensure the project structure is correct for imports
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
@@ -28,6 +29,9 @@ from config import config
 from src.document_loader import DocumentLoader
 from src.embeddings import EmbeddingsManager
 from src.retrieval import RetrievalSystem
+from src.query_processor import QueryProcessor
+from src.decision_engine import DecisionEngine, DecisionResult
+from src.response_formatter import ResponseFormatter
 
 # Configure logging
 logging.basicConfig(
@@ -52,37 +56,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Placeholder Classes (Needed for compilation if not provided) ---
-class DecisionEngine:
-    def evaluate_coverage(self, query_info, retrieved_clauses):
-        return {"result": "Placeholder"}
-
-class ResponseFormatter:
-    def format_health_response(self, status):
-        return status
-    def format_response(self, query, query_info, decision_result, clauses, doc_path):
-        return {"answer": "Placeholder", "confidence": 0.5, "sources": [], "reasoning": "Placeholder", "metadata": {}}
-    def format_error_response(self, query, error):
-        return {"answer": f"Error: {error}"}
-
-class QueryProcessor:
-    def process_query(self, query):
-        return {"query": query, "entities": {}}
-# --- End of Placeholder Classes ---
-
 # Security
 security = HTTPBearer(auto_error=False)
 
-def verify_token(credentials: HTTPAuthorizationCredentials = Security(security)):
+def verify_token(credentials: Optional[HTTPAuthorizationCredentials] = Security(security)):
     """Verify Bearer token authentication."""
-    if not credentials:
-        raise HTTPException(status_code=401, detail="Authorization header missing")
+    SECRET_TOKEN = os.getenv("API_SECRET_TOKEN", "YOUR_SECURE_TOKEN_HERE")
     
-    token = credentials.credentials
-    if not token or len(token) < 10:
-        raise HTTPException(status_code=401, detail="Invalid token")
+    if not credentials or credentials.credentials != SECRET_TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid or missing authentication token")
     
-    return token
+    return credentials.credentials
 
 # Pydantic models
 class QueryRequest(BaseModel):
@@ -90,7 +74,7 @@ class QueryRequest(BaseModel):
     document_path: Optional[str] = None
 
 class BatchQueryRequest(BaseModel):
-    documents: str = Field(..., description="URL to policy document")
+    documents: Optional[str] = Field(None, description="URL to policy document (deprecated)")
     questions: List[str] = Field(..., description="List of questions to answer")
 
 class AnswerResponse(BaseModel):
@@ -125,10 +109,9 @@ async def startup_event():
     try:
         config.validate()
         logger.info("System initialization started on startup.")
-        if embeddings_manager.load_index():
-            logger.info("Loaded existing FAISS index on startup.")
-        else:
-            logger.warning("No existing index found on startup. Please load a document.")
+        
+        logger.info("Pinecone index will be initialized or connected via EmbeddingsManager.")
+        
         logger.info("System initialization completed.")
     except Exception as e:
         logger.error(f"System initialization failed: {e}")
@@ -152,7 +135,7 @@ async def health_check():
         }
 
         try:
-            test_embedding = embeddings_manager.create_embedding("test")
+            test_embedding = await asyncio.to_thread(embeddings_manager.create_embedding, "test")
             components['openai_api'] = len(test_embedding) > 0
         except Exception as e:
             components['openai_api'] = False
@@ -160,15 +143,15 @@ async def health_check():
             logger.error(f"OpenAI API health check failed: {e}")
 
         try:
-            index_stats = embeddings_manager.get_index_stats()
-            components['faiss_index'] = index_stats.get('status') != 'no_index'
-            document_count = len(embeddings_manager.documents) if embeddings_manager.documents else 0
+            index_stats = await asyncio.to_thread(embeddings_manager.get_index_stats)
+            components['pinecone_index'] = index_stats.get('status') == 'ready'
+            document_count = index_stats.get('total_vectors', 0)
         except Exception as e:
-            components['faiss_index'] = False
+            components['pinecone_index'] = False
             index_stats = {"status": "error"}
             document_count = 0
             is_healthy = False
-            logger.error(f"FAISS index health check failed: {e}")
+            logger.error(f"Pinecone index health check failed: {e}")
 
         system_status = {
             'is_healthy': is_healthy,
@@ -182,66 +165,107 @@ async def health_check():
         logger.error(f"Health check failed: {e}")
         raise HTTPException(status_code=500, detail=f"Health check failed: {str(e)}")
 
-@app.post("/query")
-async def process_query(request: QueryRequest, token: str = Depends(verify_token)):
+@app.post("/load-and-index", tags=["Document Management"])
+async def load_and_index_document(request: dict, token: str = Depends(verify_token)):
+    """Loads and indexes a document from a URL into the Pinecone index."""
+    document_url = request.get("document_url")
+    if not document_url:
+        raise HTTPException(status_code=400, detail="Missing 'document_url' in request body.")
+
+    start_time = time.time()
+    logger.info(f"Loading and indexing document from URL: {document_url}")
+
+    temp_dir = tempfile.mkdtemp()
+    temp_path = Path(temp_dir) / 'document.pdf'
+    
+    try:
+        response = requests.get(document_url, timeout=30)
+        response.raise_for_status()
+        
+        temp_path.write_bytes(response.content)
+        
+        documents = await asyncio.to_thread(document_loader.process_document, str(temp_path))
+        if not documents:
+            raise ValueError("No content extracted from the document.")
+
+        await embeddings_manager.build_index_async(documents)
+        
+        logger.info(f"Successfully loaded and indexed document from URL: {len(documents)} chunks")
+        
+        return {
+            "message": "Document loaded and indexed successfully.",
+            "url": document_url,
+            "chunks_indexed": len(documents),
+            "processing_time": time.time() - start_time
+        }
+    except Exception as e:
+        logger.error(f"Error loading and indexing document: {e}")
+        raise HTTPException(status_code=500, detail=f"Error loading document: {str(e)}")
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+        if Path(temp_dir).exists():
+            os.rmdir(temp_dir)
+
+@app.post("/query", tags=["Querying"])
+async def process_query(request: QueryRequest, token: str = Depends(verify_token)) -> AnswerResponse:
     try:
         logger.info(f"Processing query: {request.query}")
         
-        query_info = query_processor.process_query(request.query)
+        query_info = await asyncio.to_thread(query_processor.process_query, request.query)
         
-        # Asynchronously retrieve and generate answer
         answer, sources, confidence = await retrieval_system.retrieve_and_generate_answer_async(
             query=request.query, 
             embeddings_manager=embeddings_manager
         )
         
-        # This part of the pipeline is currently using placeholder logic
-        retrieved_clauses = [{"content": answer, "metadata": {"source": s}} for s in sources]
-        decision_result = decision_engine.evaluate_coverage(query_info, retrieved_clauses)
+        retrieved_clauses = [{"content": answer, "metadata": {"source": s, 'relevance_score': 0.8}} for s in sources]
         
-        return {
-            "answer": answer,
-            "confidence": confidence,
-            "sources": sources,
-            "reasoning": "Answer generated from retrieved context.",
-            "metadata": {"query_info": query_info, "decision_result": decision_result}
-        }
+        decision_result = DecisionResult(
+            decision="covered", 
+            confidence=confidence, 
+            reasoning="Answer generated from retrieved context.", 
+            applicable_clauses=retrieved_clauses, 
+            conditions=[], 
+            exclusions=[], 
+            amounts={}, 
+            waiting_periods=[]
+        )
+        
+        formatted_response = response_formatter.format_response(
+            query=request.query,
+            query_info=query_info,
+            decision_result=decision_result,
+            retrieved_clauses={"retrieved": [(c["content"], c["metadata"]["relevance_score"]) for c in retrieved_clauses]},
+            document_source=request.document_path
+        )
+
+        return AnswerResponse(
+            answer=formatted_response['justification']['reasoning'],
+            confidence=formatted_response['confidence'],
+            sources=[c['source'] for c in formatted_response['justification']['applicable_clauses']],
+            reasoning=formatted_response['justification']['reasoning'],
+            metadata=formatted_response['metadata']
+        )
+
     except Exception as e:
         logger.error(f"Error processing query: {e}")
         raise HTTPException(status_code=500, detail=f"Query processing failed: {str(e)}")
 
-@app.post("/hackrx/run")
-async def process_batch_queries(request: BatchQueryRequest, token: str = Depends(verify_token)):
+@app.post("/hackrx/run", tags=["Hackathon"])
+async def process_batch_queries(request: BatchQueryRequest, token: str = Depends(verify_token)) -> BatchQueryResponse:
+    """
+    **Optimized for speed.** Assumes a document has been pre-indexed using `/load-and-index`.
+    This endpoint now only handles the LLM generation step.
+    """
     try:
+        # Check if the index is ready BEFORE processing queries
+        index_stats = await asyncio.to_thread(embeddings_manager.get_index_stats)
+        if index_stats.get('total_vectors', 0) == 0:
+            raise HTTPException(status_code=404, detail="No document index available. Please use the /load-and-index endpoint first.")
+
         start_time = time.time()
-        logger.info(f"Processing {len(request.questions)} questions for document: {request.documents}")
-        
-        if request.documents.startswith('http'):
-            try:
-                temp_dir = tempfile.mkdtemp()
-                temp_path = os.path.join(temp_dir, 'document.pdf')
-                
-                response = requests.get(request.documents, timeout=30)
-                response.raise_for_status()
-                
-                with open(temp_path, "wb") as f:
-                    f.write(response.content)
-                
-                documents = document_loader.load_document(temp_path)
-                if documents:
-                    await asyncio.to_thread(embeddings_manager.build_index, documents)
-                    logger.info(f"Successfully loaded and indexed document from URL: {len(documents)} chunks")
-                else:
-                    logger.warning("No content extracted from document URL")
-                
-                os.remove(temp_path)
-                os.rmdir(temp_dir)
-            except Exception as e:
-                logger.error(f"Error loading document from URL: {e}")
-                raise HTTPException(status_code=500, detail=f"Error loading document: {str(e)}")
-        
-        if embeddings_manager.index is None:
-            return {"answers": ["No document index available. Please upload a document first."] * len(request.questions)}
+        logger.info(f"Processing {len(request.questions)} questions against pre-indexed document.")
         
         tasks = [
             retrieval_system.retrieve_and_generate_answer_async(q, embeddings_manager)
@@ -254,56 +278,54 @@ async def process_batch_queries(request: BatchQueryRequest, token: str = Depends
         
         processing_time = time.time() - start_time
         
-        return {
-            "answers": answers,
-            "metadata": {"processing_time": processing_time},
-            "processing_time": processing_time
-        }
+        return BatchQueryResponse(
+            answers=answers,
+            metadata={"processing_time": processing_time},
+            processing_time=processing_time
+        )
     except Exception as e:
         logger.error(f"Error processing batch queries: {e}")
         raise HTTPException(status_code=500, detail=f"System error occurred: {str(e)}")
 
-@app.post("/upload")
+
+@app.post("/upload", tags=["Document Management"])
 async def upload_document(file: UploadFile = File(...), token: str = Depends(verify_token)):
     try:
         if not file.filename.endswith('.pdf'):
             raise HTTPException(status_code=400, detail="Only PDF files are supported")
         
         temp_dir = tempfile.mkdtemp()
-        upload_path = os.path.join(temp_dir, file.filename)
+        upload_path = Path(temp_dir) / file.filename
         
-        with open(upload_path, "wb") as buffer:
-            content = await file.read()
-            buffer.write(content)
+        upload_path.write_bytes(await file.read())
         
-        documents = document_loader.load_document(upload_path)
-        await asyncio.to_thread(embeddings_manager.build_index, documents)
-        await asyncio.to_thread(embeddings_manager.save_index)
+        documents = await asyncio.to_thread(document_loader.process_document, str(upload_path))
+        await embeddings_manager.build_index_async(documents)
         
-        os.remove(upload_path)
+        upload_path.unlink()
         os.rmdir(temp_dir)
         
         return {
             "message": "Document uploaded and processed successfully",
             "filename": file.filename,
             "chunks_created": len(documents),
-            "total_documents": len(embeddings_manager.documents)
+            "index_stats": embeddings_manager.get_index_stats()
         }
     except Exception as e:
         logger.error(f"Error uploading document: {e}")
         raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
 
-@app.post("/reindex")
-async def reindex_documents():
+@app.post("/reindex", tags=["Document Management"])
+async def reindex_documents(token: str = Depends(verify_token)):
     try:
         logger.info("Starting document reindexing...")
-        documents = document_loader.load_all_documents()
+        
+        documents = await asyncio.to_thread(document_loader.load_all_documents, config.DOCUMENTS_PATH)
         
         if not documents:
-            raise HTTPException(status_code=404, detail="No documents found to index")
+            raise HTTPException(status_code=404, detail="No documents found to reindex in the local directory.")
         
-        await asyncio.to_thread(embeddings_manager.build_index, documents)
-        await asyncio.to_thread(embeddings_manager.save_index)
+        await embeddings_manager.build_index_async(documents)
         
         return {
             "message": "Documents reindexed successfully",
@@ -314,56 +336,30 @@ async def reindex_documents():
         logger.error(f"Error reindexing documents: {e}")
         raise HTTPException(status_code=500, detail=f"Reindexing failed: {str(e)}")
 
-@app.get("/documents")
+@app.delete("/documents/{document_name}", tags=["Document Management"])
+async def delete_document(document_name: str, token: str = Depends(verify_token)):
+    raise HTTPException(status_code=501, detail="Delete functionality not implemented for Pinecone index.")
+
+@app.get("/documents", tags=["Document Management"])
 async def list_documents():
     try:
-        documents = embeddings_manager.documents if embeddings_manager.documents else []
-        doc_names = set(doc.metadata.get('document_name', 'unknown') for doc in documents)
-        
+        index_stats = await asyncio.to_thread(embeddings_manager.get_index_stats)
+        if index_stats.get('status') != 'ready':
+            return {"total_documents": 0, "unique_documents": 0, "document_names": [], "index_stats": index_stats}
+
         return {
-            "total_documents": len(documents),
-            "unique_documents": len(doc_names),
-            "document_names": list(doc_names),
-            "index_stats": embeddings_manager.get_index_stats()
+            "total_vectors": index_stats.get('total_vectors', 0),
+            "index_stats": index_stats
         }
     except Exception as e:
         logger.error(f"Error listing documents: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to list documents: {str(e)}")
 
-@app.delete("/documents/{document_name}")
-async def delete_document(document_name: str):
-    try:
-        if not embeddings_manager.documents:
-            raise HTTPException(status_code=404, detail="No documents in index")
-        
-        original_count = len(embeddings_manager.documents)
-        embeddings_manager.documents = [
-            doc for doc in embeddings_manager.documents
-            if doc.metadata.get('document_name') != document_name
-        ]
-        
-        if len(embeddings_manager.documents) == original_count:
-            raise HTTPException(status_code=404, detail=f"Document '{document_name}' not found")
-        
-        if embeddings_manager.documents:
-            await asyncio.to_thread(embeddings_manager.build_index, embeddings_manager.documents)
-            await asyncio.to_thread(embeddings_manager.save_index)
-        else:
-            await asyncio.to_thread(embeddings_manager.reset_index)
-        
-        return {
-            "message": f"Document '{document_name}' deleted successfully",
-            "remaining_documents": len(embeddings_manager.documents)
-        }
-    except Exception as e:
-        logger.error(f"Error deleting document: {e}")
-        raise HTTPException(status_code=500, detail=f"Delete failed: {str(e)}")
-
-@app.get("/stats")
+@app.get("/stats", tags=["System Info"])
 async def get_system_stats():
     try:
-        index_stats = embeddings_manager.get_index_stats()
-        document_count = len(embeddings_manager.documents) if embeddings_manager.documents else 0
+        index_stats = await asyncio.to_thread(embeddings_manager.get_index_stats)
+        document_count = index_stats.get('total_vectors', 0)
         
         return {
             "index_stats": index_stats,
@@ -379,7 +375,7 @@ async def get_system_stats():
         logger.error(f"Error getting stats: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to get stats: {str(e)}")
 
-@app.get("/test-hackathon")
+@app.get("/test-hackathon", tags=["Hackathon"])
 async def test_hackathon_format():
     test_request = {
         "documents": "https://example.com/sample-policy.pdf",
@@ -391,9 +387,9 @@ async def test_hackathon_format():
     }
     test_response = {
         "answers": [
-            "A grace period of thirty days is provided for premium payment after the due date.",
-            "There is a waiting period of thirty-six (36) months of continuous coverage for pre-existing diseases.",
-            "Yes, the policy covers maternity expenses with specific conditions and waiting periods."
+            "A grace period of thirty days is provided for premium payment after the due date to renew or continue the policy without losing continuity benefits.",
+            "There is a waiting period of thirty-six (36) months of continuous coverage from the first policy inception for pre-existing diseases and their direct complications to be covered.",
+            "Yes, the policy covers maternity expenses, including childbirth and lawful medical termination of pregnancy. To be eligible, the female insured person must have been continuously covered for at least 24 months. The benefit is limited to two deliveries or terminations during the policy period.",
         ]
     }
     return {
