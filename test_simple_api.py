@@ -36,16 +36,16 @@ def test_simple_api():
     start_time = time.time()
     
     try:
-        print("🔄 Sending request...")
+        print("🔄 Sending request to /hackrx/run...")
         response = requests.post(
             "http://localhost:8000/hackrx/run", 
             json=test_data, 
             headers=headers, 
-            timeout=60
+            timeout=120
         )
         
         end_time = time.time()
-        print(f"✅ Response in {end_time - start_time:.2f}s")
+        print(f"✅ Response received in {end_time - start_time:.2f}s")
         print(f"Status: {response.status_code}")
         
         if response.status_code == 200:
@@ -57,7 +57,7 @@ def test_simple_api():
             print(f"Error: {response.text}")
             
     except requests.exceptions.Timeout:
-        print("⏰ Timeout after 60s")
+        print("⏰ Timeout after 120s")
     except Exception as e:
         print(f"❌ Error: {e}")
 

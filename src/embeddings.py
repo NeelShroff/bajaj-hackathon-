@@ -5,26 +5,32 @@ from typing import List, Dict, Any, Optional, Tuple
 from pathlib import Path
 import numpy as np
 import faiss
-from openai import OpenAI
+from openai import OpenAI, AsyncOpenAI
 from langchain.schema import Document
+from tiktoken import get_encoding
+import asyncio
 
 from config import config
 
 logger = logging.getLogger(__name__)
+
+# Load tokenizer for token counting
+TOKEN_ENCODING = get_encoding("cl100k_base")
 
 class EmbeddingsManager:
     """Manages OpenAI embeddings and FAISS index for document retrieval."""
     
     def __init__(self):
         self.client = OpenAI(api_key=config.OPENAI_API_KEY)
+        self.async_client = AsyncOpenAI(api_key=config.OPENAI_API_KEY)
         self.index = None
         self.documents = []
-        self.dimension = 1536  # OpenAI text-embedding-ada-002 dimension
+        self.dimension = 1536
         
-    def create_embeddings(self, texts: List[str]) -> List[List[float]]:
-        """Create embeddings for a list of texts using OpenAI API."""
+    async def _async_create_embeddings_api_call(self, texts: List[str]) -> List[List[float]]:
+        """Create embeddings for a list of texts using OpenAI API asynchronously."""
         try:
-            response = self.client.embeddings.create(
+            response = await self.async_client.embeddings.create(
                 model=config.EMBEDDING_MODEL,
                 input=texts
             )
@@ -32,11 +38,55 @@ class EmbeddingsManager:
         except Exception as e:
             logger.error(f"Error creating embeddings: {e}")
             raise
-    
+
+    async def _async_batch_create_embeddings(self, texts: List[str], max_tokens_per_batch: int = 8191) -> List[List[float]]:
+        """
+        Creates embeddings in parallel batches for maximum speed.
+        """
+        tasks = []
+        current_batch_texts = []
+        current_batch_tokens = 0
+        
+        for text in texts:
+            text_tokens = len(TOKEN_ENCODING.encode(text))
+            
+            if text_tokens > max_tokens_per_batch:
+                if current_batch_texts:
+                    tasks.append(self._async_create_embeddings_api_call(current_batch_texts))
+                logger.warning(f"Chunk with {text_tokens} tokens exceeds API limit. Processing as a single call.")
+                tasks.append(self._async_create_embeddings_api_call([text]))
+                current_batch_texts = []
+                current_batch_tokens = 0
+                continue
+
+            if current_batch_tokens + text_tokens <= max_tokens_per_batch:
+                current_batch_texts.append(text)
+                current_batch_tokens += text_tokens
+            else:
+                tasks.append(self._async_create_embeddings_api_call(current_batch_texts))
+                logger.info(f"Adding a new batch of {len(current_batch_texts)} chunks with {current_batch_tokens} tokens to the queue.")
+                current_batch_texts = [text]
+                current_batch_tokens = text_tokens
+        
+        if current_batch_texts:
+            tasks.append(self._async_create_embeddings_api_call(current_batch_texts))
+            logger.info(f"Adding final batch of {len(current_batch_texts)} chunks with {current_batch_tokens} tokens to the queue.")
+            
+        # Run all API calls in parallel
+        results = await asyncio.gather(*tasks)
+        
+        all_embeddings = []
+        for batch_result in results:
+            all_embeddings.extend(batch_result)
+        
+        return all_embeddings
+
     def create_embedding(self, text: str) -> List[float]:
         """Create embedding for a single text."""
-        embeddings = self.create_embeddings([text])
-        return embeddings[0]
+        return self.client.embeddings.create(
+            model=config.EMBEDDING_MODEL,
+            input=[text]
+        ).data[0].embedding
     
     def build_index(self, documents: List[Document]) -> None:
         """Build FAISS index from documents."""
@@ -46,24 +96,44 @@ class EmbeddingsManager:
         
         logger.info(f"Building FAISS index for {len(documents)} documents")
         
-        # Extract texts from documents
-        texts = [doc.page_content for doc in documents]
+        # Split oversized chunks first
+        final_documents = []
+        for doc in documents:
+            text = doc.page_content
+            text_tokens = len(TOKEN_ENCODING.encode(text))
+            if text_tokens > 8191:
+                sub_chunks = self._split_and_batch_text(text, max_tokens=8191)
+                for i, sub_chunk in enumerate(sub_chunks):
+                    sub_chunk_doc = Document(
+                        page_content=sub_chunk,
+                        metadata={**doc.metadata, 'sub_chunk_index': i}
+                    )
+                    final_documents.append(sub_chunk_doc)
+            else:
+                final_documents.append(doc)
         
-        # Create embeddings
-        embeddings = self.create_embeddings(texts)
+        self.documents = final_documents
+        texts = [doc.page_content for doc in self.documents]
+
+        # Use asyncio to run the asynchronous embedding function
+        embeddings = asyncio.run(self._async_batch_create_embeddings(texts))
         
-        # Convert to numpy array
         embeddings_array = np.array(embeddings, dtype=np.float32)
         
-        # Create FAISS index
-        self.index = faiss.IndexFlatIP(self.dimension)  # Inner product for cosine similarity
+        self.index = faiss.IndexFlatIP(self.dimension)
         self.index.add(embeddings_array)
         
-        # Store documents for retrieval
-        self.documents = documents
-        
-        logger.info(f"FAISS index built with {self.index.ntotal} vectors")
+        logger.info(f"FAISS index built with {self.index.ntotal} vectors from {len(self.documents)} chunks")
     
+    def _split_and_batch_text(self, text: str, max_tokens: int = 8191) -> List[str]:
+        """Splits a large string into smaller parts based on token count."""
+        tokens = TOKEN_ENCODING.encode(text)
+        sub_chunks = []
+        for i in range(0, len(tokens), max_tokens):
+            sub_chunk_tokens = tokens[i:i + max_tokens]
+            sub_chunks.append(TOKEN_ENCODING.decode(sub_chunk_tokens))
+        return sub_chunks
+
     def search(self, query: str, k: int = None) -> List[Tuple[Document, float]]:
         """Search for similar documents using query embedding."""
         if self.index is None:
@@ -72,14 +142,11 @@ class EmbeddingsManager:
         if k is None:
             k = config.TOP_K_RESULTS
         
-        # Create query embedding
         query_embedding = self.create_embedding(query)
         query_vector = np.array([query_embedding], dtype=np.float32)
         
-        # Search
         scores, indices = self.index.search(query_vector, k)
         
-        # Return documents with scores
         results = []
         for i, (score, idx) in enumerate(zip(scores[0], indices[0])):
             if idx < len(self.documents):
@@ -94,7 +161,6 @@ class EmbeddingsManager:
         
         results = self.search(query, k)
         
-        # Filter by threshold
         filtered_results = [
             (doc, score) for doc, score in results 
             if score >= threshold
@@ -108,15 +174,12 @@ class EmbeddingsManager:
             self.build_index(new_documents)
             return
         
-        # Extract texts and create embeddings
         texts = [doc.page_content for doc in new_documents]
-        embeddings = self.create_embeddings(texts)
+        embeddings = asyncio.run(self._async_batch_create_embeddings(texts))
+        
         embeddings_array = np.array(embeddings, dtype=np.float32)
         
-        # Add to index
         self.index.add(embeddings_array)
-        
-        # Add to documents list
         self.documents.extend(new_documents)
         
         logger.info(f"Added {len(new_documents)} documents to index. Total: {self.index.ntotal}")
@@ -126,14 +189,11 @@ class EmbeddingsManager:
         if file_path is None:
             file_path = config.FAISS_INDEX_PATH
         
-        # Create directory if it doesn't exist
         Path(file_path).parent.mkdir(parents=True, exist_ok=True)
         
-        # Save FAISS index
         index_path = f"{file_path}.faiss"
         faiss.write_index(self.index, index_path)
         
-        # Save documents metadata
         docs_path = f"{file_path}.pkl"
         with open(docs_path, 'wb') as f:
             pickle.dump(self.documents, f)
@@ -153,10 +213,8 @@ class EmbeddingsManager:
             return False
         
         try:
-            # Load FAISS index
             self.index = faiss.read_index(index_path)
             
-            # Load documents
             with open(docs_path, 'rb') as f:
                 self.documents = pickle.load(f)
             
@@ -184,16 +242,3 @@ class EmbeddingsManager:
         self.index = None
         self.documents = []
         logger.info("Index reset")
-    
-    def batch_create_embeddings(self, texts: List[str], batch_size: int = 100) -> List[List[float]]:
-        """Create embeddings in batches to handle rate limits."""
-        all_embeddings = []
-        
-        for i in range(0, len(texts), batch_size):
-            batch = texts[i:i + batch_size]
-            batch_embeddings = self.create_embeddings(batch)
-            all_embeddings.extend(batch_embeddings)
-            
-            logger.info(f"Processed batch {i//batch_size + 1}/{(len(texts) + batch_size - 1)//batch_size}")
-        
-        return all_embeddings 

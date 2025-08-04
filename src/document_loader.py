@@ -11,6 +11,7 @@ import docx
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.schema import Document
 from datetime import datetime
+import re
 
 from config import config
 
@@ -93,7 +94,7 @@ class DocumentLoader:
                 is_section_header = True
             # Pattern 3: All caps headers that look like section titles
             elif (len(line) < 100 and line.isupper() and 
-                  any(keyword in line_upper for keyword in ['COVERAGE', 'BENEFITS', 'EXCLUSIONS', 'CONDITIONS', 'TERMS', 'CLAIMS', 'DEFINITIONS'])):
+                  any(keyword in line_upper for keyword in ['COVERAGE', 'BENEFITS', 'EXCLUSIONS', 'CONDITIONS', 'TERMS', 'CLAIMS', 'DEFINITIONS', 'AYUSH'])):
                 is_section_header = True
                 
             if is_section_header:
@@ -129,28 +130,40 @@ class DocumentLoader:
         return sections
     
     def create_chunks(self, sections: List[Dict[str, Any]], document_name: str) -> List[Document]:
-        """Create LangChain Document chunks from sections with UNIVERSAL document handling."""
+        """🚀 REVOLUTIONARY: Semantic chunk enhancement with metadata cleaning."""
         documents = []
         
         for section in sections:
-            # STRATEGY 1: Standard chunking
-            section_chunks = self.text_splitter.split_text(section['content'])
+            # BREAKTHROUGH 1: Clean content before chunking
+            cleaned_content = self._semantic_content_cleaning(section['content'])
             
-            for i, chunk in enumerate(section_chunks):
-                metadata = {
-                    'document_name': document_name,
-                    'section_id': section['section_id'],
-                    'section_type': section['type'],
-                    'chunk_index': i,
-                    'total_chunks': len(section_chunks),
-                    'source': f"{document_name}_{section['section_id']}_{i}",
-                    'chunk_strategy': 'standard'
-                }
-                
-                documents.append(Document(
-                    page_content=chunk,
-                    metadata=metadata
-                ))
+            # BREAKTHROUGH 2: Multi-granularity chunking
+            chunk_variants = self._multi_granularity_chunking(cleaned_content)
+            
+            for variant_type, chunks in chunk_variants.items():
+                for i, chunk in enumerate(chunks):
+                    # BREAKTHROUGH 3: Content-type classification
+                    content_type = self._classify_content_type(chunk)
+                    
+                    # Enhanced metadata with content classification
+                    metadata = {
+                        'document_name': document_name,
+                        'section_id': section['section_id'],
+                        'section_type': section['type'],
+                        'chunk_index': i,
+                        'total_chunks': len(chunks),
+                        'source': f"{document_name}_{section['section_id']}_{i}",
+                        'chunk_strategy': f'semantic_{variant_type}',
+                        'content_type': content_type,
+                        'semantic_quality': self._calculate_semantic_quality(chunk),
+                        'original_length': len(section['content']),
+                        'cleaned_length': len(chunk)
+                    }
+                    
+                    documents.append(Document(
+                        page_content=chunk,
+                        metadata=metadata
+                    ))
             
             # STRATEGY 2: Definition-aware chunking for terms like "Grace Period means..."
             content = section['content']
@@ -162,7 +175,6 @@ class DocumentLoader:
             ]
             
             for pattern in definition_patterns:
-                import re
                 matches = re.findall(pattern, content, re.IGNORECASE | re.DOTALL)
                 for match in matches:
                     if len(match.strip()) > 50:  # Only meaningful definitions
@@ -171,7 +183,7 @@ class DocumentLoader:
                             'section_id': section['section_id'],
                             'section_type': 'definition',
                             'chunk_index': f"def_{len(documents)}",
-                            'total_chunks': len(section_chunks),
+                            'total_chunks': len(documents),
                             'source': f"{document_name}_{section['section_id']}_def",
                             'chunk_strategy': 'definition_aware'
                         }
@@ -182,6 +194,107 @@ class DocumentLoader:
                         ))
         
         return documents
+    
+    def _semantic_content_cleaning(self, content: str) -> str:
+        """🧠 BREAKTHROUGH 1: Clean content for better embeddings."""
+        
+        # Remove metadata pollution that dilutes embeddings
+        cleaned = content
+        
+        # Remove document headers and footers
+        patterns_to_remove = [
+            r'Page \d+ of \d+',
+            r'UIN: [A-Z0-9]+',
+            r'Premises No\. [0-9\-]+',
+            r'Plot no\. [A-Z0-9\-]+',
+            r'New Town, Kolkata - \d+',
+            r'Ltd\. National Parivar Mediclaim Plus Policy',
+            r'CBD-\d+',
+        ]
+        
+        for pattern in patterns_to_remove:
+            cleaned = re.sub(pattern, '', cleaned, flags=re.IGNORECASE)
+        
+        # Clean up extra whitespace
+        cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+        
+        # Remove very short fragments that add noise
+        if len(cleaned) < 20:
+            return content  # Keep original if cleaning makes it too short
+        
+        return cleaned
+    
+    def _multi_granularity_chunking(self, content: str) -> Dict[str, List[str]]:
+        """🎯 BREAKTHROUGH 2: Multiple chunk sizes for better coverage."""
+        chunk_variants = {}
+        
+        # Small chunks (good for precise matching)
+        small_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=400,
+            chunk_overlap=100,
+            separators=["\n\n", "\n", ". ", " ", ""]
+        )
+        chunk_variants['small'] = small_splitter.split_text(content)
+        
+        # Medium chunks (balanced)
+        medium_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=800,
+            chunk_overlap=200,
+            separators=["\n\n", "\n", ". ", " ", ""]
+        )
+        chunk_variants['medium'] = medium_splitter.split_text(content)
+        
+        return chunk_variants
+    
+    def _classify_content_type(self, chunk: str) -> str:
+        """🔍 BREAKTHROUGH 3: Classify content type for intelligent retrieval."""
+        chunk_lower = chunk.lower()
+        
+        # Policy/Coverage content (highest priority for coverage queries)
+        if any(term in chunk_lower for term in ['shall indemnify', 'company shall', 'coverage', 'benefit', 'reimburse']):
+            return 'policy'
+        
+        # Definitions (good for understanding but not primary coverage)
+        if any(term in chunk_lower for term in ['means', 'refers to', 'defined as', 'includes']):
+            return 'definition'
+        
+        # Tables and structured data
+        if any(term in chunk_lower for term in ['plan a', 'plan b', 'plan c', 'table', 'features']):
+            return 'table'
+        
+        # Procedures and processes
+        if any(term in chunk_lower for term in ['procedure', 'process', 'steps', 'how to']):
+            return 'procedure'
+        
+        # Exclusions and limitations
+        if any(term in chunk_lower for term in ['exclude', 'not cover', 'limitation', 'except']):
+            return 'exclusion'
+        
+        return 'general'
+    
+    def _calculate_semantic_quality(self, chunk: str) -> float:
+        """📊 Calculate semantic quality score for chunk prioritization."""
+        # Higher score = better semantic quality
+        score = 0.5  # Base score
+        
+        # Bonus for structured content
+        if any(pattern in chunk for pattern in ['. ', ':', ';']):
+            score += 0.1
+        
+        # Bonus for policy language
+        policy_terms = ['shall', 'coverage', 'benefit', 'indemnify', 'reimburse']
+        policy_matches = sum(1 for term in policy_terms if term.lower() in chunk.lower())
+        score += policy_matches * 0.05
+        
+        # Penalty for very short chunks
+        if len(chunk) < 50:
+            score -= 0.2
+        
+        # Bonus for optimal length
+        if 200 <= len(chunk) <= 800:
+            score += 0.1
+        
+        return min(max(score, 0.0), 1.0)  # Clamp between 0 and 1
     
     def process_document(self, file_path: str) -> List[Document]:
         """Process a single document and return chunks."""
@@ -287,31 +400,10 @@ class DocumentLoader:
             if not text.strip():
                 raise ValueError(f"No text extracted from {file_path}")
             
-            # Create enhanced metadata
-            metadata = {
-                "source": file_path,
-                "filename": os.path.basename(file_path),
-                "file_format": file_format,
-                "file_size": os.path.getsize(file_path),
-                "total_chars": len(text),
-                "processed_at": datetime.now().isoformat(),
-                "loader_version": "2.0"
-            }
-            
-            # Split into chunks
-            chunks = self.text_splitter.split_text(text)
-            
-            # Create Document objects with enhanced metadata
-            documents = []
-            for i, chunk in enumerate(chunks):
-                chunk_metadata = metadata.copy()
-                chunk_metadata.update({
-                    "chunk_id": i,
-                    "chunk_size": len(chunk),
-                    "chunk_start_char": sum(len(c) for c in chunks[:i]),
-                    "chunk_end_char": sum(len(c) for c in chunks[:i+1])
-                })
-                documents.append(Document(page_content=chunk, metadata=chunk_metadata))
+            # Split into chunks using the improved method
+            document_name = Path(file_path).stem
+            sections = self.extract_sections(text)
+            documents = self.create_chunks(sections, document_name)
             
             logger.info(f"Successfully loaded {len(documents)} chunks from {file_path} ({file_format})")
             return documents
@@ -382,4 +474,4 @@ class DocumentLoader:
             ))
         
         logger.info(f"Loaded {len(documents)} documents from cache")
-        return documents 
+        return documents

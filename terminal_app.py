@@ -56,6 +56,7 @@ class DocumentQueryCLI:
         self.state_file = self.cache_dir / "cli_state.json"
         self.embeddings_file = self.cache_dir / "cli_embeddings.faiss"
         self.documents_file = self.cache_dir / "cli_documents.pkl"
+        self.current_document = None
     
     def initialize_system(self):
         """Initialize system components"""
@@ -213,12 +214,14 @@ class DocumentQueryCLI:
                 'loaded_at': datetime.now().isoformat(),
                 'processing_time': time.time() - start_time
             }
+            self.current_document = document_path
             
             processing_time = time.time() - start_time
             print(f"✅ Successfully loaded {len(documents)} chunks in {processing_time:.2f}s")
             print(f"📊 Document: {doc_key}")
-            print(f"📄 Format: {documents[0].metadata.get('file_format', 'unknown')}")
-            print(f"📏 Total characters: {documents[0].metadata.get('total_chars', 'unknown')}")
+            if documents:
+                print(f"📄 Format: {documents[0].metadata.get('file_format', 'unknown')}")
+                print(f"📏 Total characters: {documents[0].metadata.get('total_chars', 'unknown')}")
             
             # Save state for persistence between CLI commands
             self.save_state()
@@ -247,7 +250,6 @@ class DocumentQueryCLI:
         
         # Check if we have loaded documents (either from current session or persistent state)
         if not self.loaded_documents:
-            # Try to load state if not already done
             if not self.load_state():
                 print("❌ No documents loaded. Run 'load <document_path>' first.")
                 return
@@ -256,57 +258,70 @@ class DocumentQueryCLI:
             print(f"🔍 Processing query: {question}")
             start_time = time.time()
             
-            # Get relevant chunks directly (simplified for CLI)
+            # Step 1: Retrieve relevant chunks with the improved retrieval system
             relevant_chunks = self.retrieval_system.retrieve_relevant_chunks(
-                question, 
-                self.embeddings_manager
+                query=question, 
+                embeddings_manager=self.embeddings_manager,
+                k=4 # Retrieve a few chunks for good context
             )
             
             if not relevant_chunks:
-                print("❌ No relevant information found")
+                print("❌ No relevant information found.")
                 return
             
             # DEBUG: Show retrieved chunks for investigation
             print(f"\n🔍 DEBUG - Retrieved {len(relevant_chunks)} chunks:")
-            for i, chunk in enumerate(relevant_chunks[:3]):
+            for i, chunk in enumerate(relevant_chunks):
                 print(f"  Chunk {i+1} (confidence: {chunk.get('confidence', 'N/A'):.3f}):")
-                print(f"    {chunk['content'][:200]}...")
+                print(f"    Source: {chunk['metadata'].get('filename', 'Unknown')}, Section: {chunk['metadata'].get('section_id', 'N/A')}")
+                print(f"    Content: {chunk['content'][:200]}...")
                 print()
+
+            # Step 2: Assemble the context window for the LLM
+            context_parts = []
+            current_length = 0
+            max_context_length = 2000  # A reasonable limit for GPT-3.5-turbo
+
+            for chunk in relevant_chunks:
+                content = chunk['content']
+                # Stop adding chunks if the context window is full
+                if current_length + len(content) <= max_context_length:
+                    context_parts.append(content)
+                    current_length += len(content)
+                else:
+                    break
             
-            # Generate answer using LLM - OPTIMIZED for speed and accuracy
-            context = "\n\n".join([chunk['content'] for chunk in relevant_chunks[:4]])[:1200]  # Match API settings
+            context = "\n\n".join(context_parts)
             
             # DEBUG: Show exact context being sent to LLM
             print(f"\n📝 DEBUG - Context being sent to LLM ({len(context)} chars):")
-            print(f"'{context}'")
+            print(f"'{context[:500]}...'")
             print("\n" + "="*50)
             
-            # Simple LLM call for answer generation using OpenAI v1.0+ API
+            # Step 3: Generate a nuanced answer using a better-structured prompt
             from openai import OpenAI
             client = OpenAI(api_key=config.OPENAI_API_KEY)
             
-            # AGGRESSIVE prompt for precise extraction
-            prompt = f"""EXTRACT the specific answer from this insurance policy text. Look for exact numbers, periods, and details.
+            prompt = f"""You are an insurance policy expert. Your task is to provide a comprehensive and accurate answer to the user's question based ONLY on the provided policy text.
 
-Policy Text:
+POLICY DOCUMENT:
 {context}
 
-Question: {question}
+QUESTION: {question}
 
 INSTRUCTIONS:
-- Find the EXACT answer in the text above
-- Include specific numbers (days, months, percentages) 
-- If you see "thirty days" or "30 days" - state it clearly
-- If you see "Grace Period...thirty days" - extract that information
-- Be direct and specific
+- Do not make up any information.
+- If the policy text provides a specific number (e.g., '30 days', '24 months', '5%'), include that number in your answer.
+- If the policy mentions conditions, exclusions, or limitations, summarize them clearly.
+- If the policy text does not contain the answer, state that "The policy document does not contain information on this topic."
 
 Answer:"""
             
             response = client.chat.completions.create(
                 model=config.OPENAI_MODEL,
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.1,  # Match API settings
-                max_tokens=80     # Match API settings for speed
+                temperature=0.2,  # A slightly higher temperature for more descriptive answers
+                max_tokens=150    # Sufficient for a detailed answer
             )
             
             answer = response.choices[0].message.content.strip()
@@ -320,10 +335,11 @@ Answer:"""
             
             # Show source citations
             print(f"\n📚 Sources:")
-            for i, chunk in enumerate(relevant_chunks[:3]):
+            for i, chunk in enumerate(relevant_chunks):
                 source = chunk.get('metadata', {}).get('filename', 'Unknown')
-                similarity = chunk.get('similarity', 0)
-                print(f"  {i+1}. {source} (similarity: {similarity:.3f})")
+                confidence = chunk.get('confidence', 0)
+                section = chunk.get('metadata', {}).get('section_id', 'N/A')
+                print(f"  {i+1}. {source} (Confidence: {confidence:.3f}) - Section: {section}")
             
             # Add to query history
             self.query_history.append({
@@ -526,103 +542,45 @@ Answer:"""
                 if not self.load_documents(document_url):
                     return {"answers": ["Failed to load document"] * len(questions)}
             
-            # Check if index exists
             if self.embeddings_manager.index is None:
                 return {"answers": ["No document index available. Please load documents first."] * len(questions)}
             
             answers = []
             
-            # PHASE 1: BATCH EMBEDDINGS - Single API call for all questions
             print("🔄 Creating batch embeddings for all questions...")
             question_embeddings = self.embeddings_manager.create_embeddings(questions)
             
-            # PHASE 2: BATCH RETRIEVAL - Process all questions efficiently
             for i, (question, question_embedding) in enumerate(zip(questions, question_embeddings)):
                 try:
                     print(f"🔄 Processing question {i+1}/{len(questions)}: {question[:50]}...")
                     
-                    # Convert to numpy array for FAISS search
                     query_vector = np.array([question_embedding], dtype=np.float32)
                     
-                    # Search FAISS index with optimized parameters
-                    similarities, indices = self.embeddings_manager.index.search(
-                        query_vector, 
-                        k=min(8, len(self.embeddings_manager.documents))
+                    # Perform retrieval using the main retrieval method
+                    relevant_chunks = self.retrieval_system.retrieve_relevant_chunks(
+                        query=question, 
+                        embeddings_manager=self.embeddings_manager, 
+                        k=4
                     )
                     
-                    # DEBUG: Print initial search results
-                    print(f"🔍 DEBUG: FAISS search returned {len(similarities[0])} results")
-                    print(f"🔍 DEBUG: Top 3 similarities: {similarities[0][:3]}")
-                    print(f"🔍 DEBUG: Similarity threshold: {config.SIMILARITY_THRESHOLD}")
-                    
-                    # OPTIMIZED CHUNK SELECTION - More aggressive retrieval for hackathon
-                    relevant_chunks = []
-                    question_lower = question.lower()
-                    
-                    # Process all retrieved chunks with enhanced scoring
-                    for similarity, idx in zip(similarities[0], indices[0]):
-                        if idx < len(self.embeddings_manager.documents):
-                            chunk = self.embeddings_manager.documents[idx]
-                            chunk_lower = chunk.page_content.lower()
-                            
-                            # Start with base similarity score
-                            score = float(similarity)
-                            
-                            # AGGRESSIVE KEYWORD MATCHING for insurance domain
-                            insurance_keywords = {
-                                'grace': 0.3, 'waiting': 0.3, 'period': 0.2, 'coverage': 0.25, 'premium': 0.2,
-                                'policy': 0.15, 'benefit': 0.2, 'claim': 0.2, 'exclusion': 0.25, 'limit': 0.2,
-                                'maternity': 0.3, 'pre-existing': 0.3, 'hospital': 0.2, 'treatment': 0.2,
-                                'surgery': 0.25, 'organ': 0.3, 'donor': 0.3, 'cataract': 0.3, 'dental': 0.25,
-                                'sum insured': 0.3, 'room rent': 0.25, 'icu': 0.2, 'ayush': 0.25
-                            }
-                            
-                            # Boost score for keyword matches
-                            for keyword, boost in insurance_keywords.items():
-                                if keyword in question_lower and keyword in chunk_lower:
-                                    score += boost
-                            
-                            # Additional scoring for question word matches
-                            question_words = [w for w in question_lower.split() if len(w) > 3 and w not in ['what', 'does', 'this', 'policy', 'under', 'with', 'from', 'that', 'have', 'been']]
-                            word_matches = sum(1 for word in question_words if word in chunk_lower)
-                            if word_matches > 0:
-                                score += (word_matches * 0.1)
-                            
-                            # Include chunks with reasonable similarity OR strong keyword matches
-                            if similarity > config.SIMILARITY_THRESHOLD or score > (similarity + 0.2):
-                                relevant_chunks.append((chunk.page_content, score, similarity))
-                    
-                    # Sort by enhanced score and select top chunks
-                    relevant_chunks.sort(key=lambda x: x[1], reverse=True)
-                    top_chunks = [chunk for chunk, score, sim in relevant_chunks[:6]]  # Increased to 6 chunks
-                    
-                    # DEBUG: Print retrieval info
-                    print(f"🔍 DEBUG: Found {len(relevant_chunks)} relevant chunks for question: {question[:50]}...")
-                    if relevant_chunks:
-                        print(f"🔍 DEBUG: Top chunk score: {relevant_chunks[0][1]:.3f}, similarity: {relevant_chunks[0][2]:.3f}")
-                        print(f"🔍 DEBUG: Top chunk preview: {relevant_chunks[0][0][:100]}...")
-                    
                     # PHASE 3: OPTIMIZED ANSWER GENERATION
-                    if top_chunks:
-                        # Smart context window management
+                    if relevant_chunks:
                         context_parts = []
-                        total_length = 0
+                        current_length = 0
                         max_context_length = 2000
                         
-                        for chunk in top_chunks:
-                            if total_length + len(chunk) <= max_context_length:
-                                context_parts.append(chunk)
-                                total_length += len(chunk)
+                        for chunk in relevant_chunks:
+                            content = chunk['content']
+                            if current_length + len(content) <= max_context_length:
+                                context_parts.append(content)
+                                current_length += len(content)
                             else:
-                                remaining_space = max_context_length - total_length
-                                if remaining_space > 200:
-                                    context_parts.append(chunk[:remaining_space] + "...")
                                 break
                         
                         context = "\n\n".join(context_parts)
                         
-                        # HACKATHON-OPTIMIZED PROMPT for direct answers
-                        prompt = f"""You are an insurance policy expert. Extract the exact answer from the policy document below.
+                        # New, better prompt for robust answer generation
+                        prompt = f"""You are an insurance policy expert. Your task is to provide a comprehensive and accurate answer to the user's question based ONLY on the provided policy text.
 
 POLICY DOCUMENT:
 {context}
@@ -630,26 +588,23 @@ POLICY DOCUMENT:
 QUESTION: {question}
 
 INSTRUCTIONS:
-1. Find the specific clause or section that answers the question
-2. Extract the exact information (numbers, periods, conditions) as written in the policy
-3. Be precise and concise - provide only the essential answer
-4. If the information exists but has conditions, include the key conditions
-5. If the exact information is not found, respond with: "Information not available in the provided document"
+- Do not make up any information.
+- If the policy text provides a specific number (e.g., '30 days', '24 months', '5%'), include that number in your answer.
+- If the policy mentions conditions, exclusions, or limitations, summarize them clearly.
+- If the policy text does not contain the answer, state that "The policy document does not contain information on this topic."
 
-Direct Answer:"""
+Answer:"""
                         
-                        # Generate answer with optimized parameters
                         response = self.embeddings_manager.client.chat.completions.create(
                             model=config.OPENAI_MODEL,
                             messages=[{"role": "user", "content": prompt}],
-                            temperature=0.05,
+                            temperature=0.2,
                             max_tokens=150,
                             top_p=0.9
                         )
                         
                         answer = response.choices[0].message.content.strip()
                         
-                        # Clean up answer formatting
                         if answer.startswith('ANSWER:'):
                             answer = answer[7:].strip()
                         elif answer.startswith('Direct Answer:'):
@@ -659,7 +614,7 @@ Direct Answer:"""
                         print(f"✅ Answer {i+1}: {answer[:100]}...")
                         
                     else:
-                        answer = "Information not available in the provided document."
+                        answer = "The policy document does not contain information on this topic."
                         answers.append(answer)
                         print(f"✅ Answer {i+1}: {answer}")
                         
@@ -740,7 +695,6 @@ Direct Answer:"""
                 if not user_input:
                     continue
                 
-                # Handle commands
                 if user_input.lower() in ['quit', 'exit']:
                     print("👋 Goodbye! Thanks for using HackRx 6.0 system!")
                     break
@@ -754,15 +708,12 @@ Direct Answer:"""
                     print("• 'stats' - Show system statistics")
                     print("• 'quit' or 'exit' - Exit")
                 
-                elif user_input.lower() == 'load':
-                    self.load_documents()
-                
-                elif user_input.lower().startswith('load-url '):
-                    url = user_input[9:].strip()
-                    if url:
-                        self.load_documents(url)
+                elif user_input.lower().startswith('load '):
+                    path = user_input[5:].strip()
+                    if path:
+                        self.load_command(path)
                     else:
-                        print("❌ Please provide a URL after 'load-url'")
+                        print("❌ Please specify a document path")
                 
                 elif user_input.lower() == 'stats':
                     self.show_stats()
