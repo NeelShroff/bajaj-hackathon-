@@ -1,0 +1,13 @@
+{
+  "loaded_documents": {
+    "policy.pdf?sv=2023-01-03&st=2025-07-04T09%3A11%3A24Z&se=2027-07-05T09%3A11%3A00Z&sr=b&sp=r&sig=N4a9OU0w0QXO6AOIBiu4bpl7AXvEZogeT%2FjUHNO7HzQ%3D": {
+      "path": "https://hackrx.blob.core.windows.net/assets/policy.pdf?sv=2023-01-03&st=2025-07-04T09%3A11%3A24Z&se=2027-07-05T09%3A11%3A00Z&sr=b&sp=r&sig=N4a9OU0w0QXO6AOIBiu4bpl7AXvEZogeT%2FjUHNO7HzQ%3D",
+      "chunks": 157,
+      "loaded_at": "2025-08-04T15:33:38.029494",
+      "processing_time": 8.482905626296997
+    }
+  },
+  "query_history": [],
+  "initialized": true,
+  "last_updated": "2025-08-04T15:33:38.029494"
+}

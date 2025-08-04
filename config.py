@@ -24,13 +24,13 @@ class Config:
     MAX_TOKENS: int = int(os.getenv("MAX_TOKENS", "4000"))
     TEMPERATURE: float = float(os.getenv("TEMPERATURE", "0.1"))
     
-    # Chunking Settings
+    # Chunking Settings - Improved for better retrieval
     CHUNK_SIZE: int = 1000
-    CHUNK_OVERLAP: int = 200
+    CHUNK_OVERLAP: int = 300  # Increased overlap to preserve context
     
-    # Retrieval Settings
-    TOP_K_RESULTS: int = 5
-    SIMILARITY_THRESHOLD: float = 0.7
+    # Retrieval Settings - Optimized for HackRx 6.0
+    TOP_K_RESULTS: int = 8
+    SIMILARITY_THRESHOLD: float = 0.4  # Further lowered for maximum recall in hackathon
     
     @classmethod
     def validate(cls) -> bool:

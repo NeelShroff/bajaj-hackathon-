@@ -1,14 +1,21 @@
 import logging
 import os
-from typing import Optional, List
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+import requests
+import tempfile
+import asyncio
 import uvicorn
+import numpy as np
+from datetime import datetime
+from typing import Optional, List, Dict, Any
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, Security
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 
 from config import config
 from src.document_loader import DocumentLoader
 from src.embeddings import EmbeddingsManager
+from src.retrieval import RetrievalSystem
 from src.query_processor import QueryProcessor
 from src.retrieval import RetrievalSystem
 from src.decision_engine import DecisionEngine
@@ -37,14 +44,42 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Security
+security = HTTPBearer(auto_error=False)
+
+def verify_token(credentials: HTTPAuthorizationCredentials = Security(security)):
+    """Verify Bearer token authentication."""
+    if not credentials:
+        raise HTTPException(status_code=401, detail="Authorization header missing")
+    
+    token = credentials.credentials
+    # For hackathon: accept any non-empty token
+    # In production: implement proper JWT validation
+    if not token or len(token) < 10:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    
+    return token
+
 # Pydantic models
 class QueryRequest(BaseModel):
     query: str
     document_path: Optional[str] = None
 
 class BatchQueryRequest(BaseModel):
-    queries: List[str]
-    document_path: Optional[str] = None
+    documents: str = Field(..., description="URL to policy document")
+    questions: List[str] = Field(..., description="List of questions to answer")
+
+class AnswerResponse(BaseModel):
+    answer: str = Field(..., description="The answer to the question")
+    confidence: float = Field(..., description="Confidence score (0-1)")
+    sources: List[str] = Field(..., description="Source citations")
+    reasoning: Optional[str] = Field(None, description="Reasoning chain")
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="Additional metadata")
+
+class BatchQueryResponse(BaseModel):
+    answers: List[str] = Field(..., description="List of answers")
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="Response metadata")
+    processing_time: float = Field(..., description="Processing time in seconds")
 
 class SystemStatus(BaseModel):
     is_healthy: bool
@@ -73,8 +108,8 @@ def initialize_system():
         # Initialize components
         document_loader = DocumentLoader()
         embeddings_manager = EmbeddingsManager()
-        query_processor = QueryProcessor()
         retrieval_system = RetrievalSystem(embeddings_manager)
+        query_processor = QueryProcessor()
         decision_engine = DecisionEngine()
         response_formatter = ResponseFormatter()
         
@@ -157,7 +192,7 @@ async def health_check():
         raise HTTPException(status_code=500, detail=f"Health check failed: {str(e)}")
 
 @app.post("/query")
-async def process_query(request: QueryRequest):
+async def process_query(request: QueryRequest, token: str = Depends(verify_token)):
     """Process a single natural language query."""
     try:
         logger.info(f"Processing query: {request.query}")
@@ -190,47 +225,126 @@ async def process_query(request: QueryRequest):
         logger.error(f"Error processing query: {e}")
         return response_formatter.format_error_response(request.query, str(e))
 
-@app.post("/batch-query")
-async def process_batch_queries(request: BatchQueryRequest):
-    """Process multiple queries in batch."""
+@app.post("/hackrx/run")
+async def process_batch_queries(request: BatchQueryRequest, token: str = Depends(verify_token)):
+    """Process multiple queries in batch - HackRx 6.0 API Compliant."""
     try:
-        logger.info(f"Processing batch queries: {len(request.queries)} queries")
+        logger.info(f"Processing {len(request.questions)} questions for document: {request.documents}")
         
-        results = []
-        for query in request.queries:
+        # Load document if it's a URL (optimized for hackathon)
+        if request.documents.startswith('http'):
+            logger.info(f"Document URL provided: {request.documents}")
             try:
-                # Process individual query
-                query_info = query_processor.process_query(query)
-                retrieved_clauses = retrieval_system.contextual_retrieval(query_info)
-                decision_result = decision_engine.evaluate_coverage(query_info, retrieved_clauses)
+                # Download and process document dynamically
+                response = requests.get(request.documents, timeout=30)
+                response.raise_for_status()
                 
-                # Calculate amounts
-                amounts = decision_engine.calculate_coverage_amount(decision_result, query_info['entities'])
-                decision_result.amounts = amounts
+                # Save to temporary file
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_file:
+                    temp_file.write(response.content)
+                    temp_path = temp_file.name
                 
-                # Format response
-                response = response_formatter.format_response(
-                    query,
-                    query_info,
-                    decision_result,
-                    retrieved_clauses,
-                    request.document_path
-                )
-                results.append(response)
+                # Load and index the document
+                documents = document_loader.load_document(temp_path)
+                if documents:
+                    embeddings_manager.build_index(documents)
+                    logger.info(f"Successfully loaded and indexed document from URL: {len(documents)} chunks")
+                else:
+                    logger.warning("No content extracted from document URL")
+                
+                # Clean up temp file
+                os.unlink(temp_path)
                 
             except Exception as e:
-                logger.error(f"Error processing query '{query}': {e}")
-                error_response = response_formatter.format_error_response(query, str(e))
-                results.append(error_response)
+                logger.error(f"Error loading document from URL: {e}")
+                return {"answers": [f"Error loading document: {str(e)}"] * len(request.questions)}
         
-        return response_formatter.format_batch_response(request.queries, results)
+        # CRITICAL: Check if index exists
+        if embeddings_manager.index is None:
+            return {"answers": ["No document index available. Please upload a document first."] * len(request.questions)}
+        
+        answers = []
+        
+        try:
+            # PHASE 1: BATCH EMBEDDINGS - Single API call for all questions
+            logger.info("Creating batch embeddings for all questions")
+            question_embeddings = embeddings_manager.create_embeddings(request.questions)
+            
+            # PHASE 2: PARALLEL RETRIEVAL AND PROCESSING
+            async def process_single_question(question: str, question_embedding: List[float]) -> str:
+                """Process a single question asynchronously"""
+                try:
+                    # Use the sophisticated RetrievalSystem for much better accuracy
+                    relevant_chunks = retrieval_system.retrieve_relevant_chunks(
+                        question, embeddings_manager, k=6
+                    )
+                    
+                    if relevant_chunks:
+                        # Extract content from sophisticated retrieval results
+                        contexts = [chunk['content'] for chunk in relevant_chunks[:4]]
+                        context = "\n\n".join(contexts)[:1200]
+                        
+                        # Improved prompt for better answer extraction
+                        prompt = f"""Based on this insurance policy content, answer the question concisely:
+
+{context}
+
+Question: {question}
+Answer:"""
+                        
+                        # Async LLM call with balanced tokens
+                        response = await asyncio.to_thread(
+                            embeddings_manager.client.chat.completions.create,
+                            model=config.OPENAI_MODEL,
+                            messages=[{"role": "user", "content": prompt}],
+                            temperature=0.1,
+                            max_tokens=80
+                        )
+                        
+                        answer = response.choices[0].message.content.strip()
+                        return answer
+                    else:
+                        return "Information not available in the provided document."
+                        
+                except Exception as e:
+                    logger.error(f"Error processing question '{question}': {e}")
+                    return "Error processing this question."
+            
+            # PHASE 3: PARALLEL PROCESSING - Process all questions simultaneously
+            logger.info(f"Processing {len(request.questions)} questions in parallel")
+            
+            # Create async tasks for all questions
+            tasks = [
+                process_single_question(question, embedding) 
+                for question, embedding in zip(request.questions, question_embeddings)
+            ]
+            
+            # Execute all tasks in parallel
+            answers = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Handle any exceptions in results
+            final_answers = []
+            for answer in answers:
+                if isinstance(answer, Exception):
+                    logger.error(f"Task failed: {answer}")
+                    final_answers.append("Error processing this question.")
+                else:
+                    final_answers.append(str(answer))
+                    
+        except Exception as e:
+            logger.error(f"Error in batch processing: {e}")
+            # Fallback answers
+            final_answers = ["Error in processing. Please try again."] * len(request.questions)
+        
+        # CRITICAL: Return in exact hackathon API format
+        return {"answers": final_answers}
         
     except Exception as e:
         logger.error(f"Error processing batch queries: {e}")
-        raise HTTPException(status_code=500, detail=f"Batch processing failed: {str(e)}")
+        return {"answers": ["System error occurred. Please try again."] * len(request.questions)}
 
-@app.post("/upload-document")
-async def upload_document(file: UploadFile = File(...)):
+@app.post("/upload")
+async def upload_document(file: UploadFile = File(...), token: str = Depends(verify_token)):
     """Upload and process a new policy document."""
     try:
         if not file.filename.endswith('.pdf'):
@@ -368,6 +482,43 @@ async def get_system_stats():
     except Exception as e:
         logger.error(f"Error getting stats: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to get stats: {str(e)}")
+
+@app.get("/test-hackathon")
+async def test_hackathon_format():
+    """Test endpoint for hackathon API format validation."""
+    try:
+        # Sample test data matching hackathon format
+        test_request = {
+            "documents": "https://example.com/sample-policy.pdf",
+            "questions": [
+                "What is the grace period for premium payment?",
+                "What is the waiting period for pre-existing diseases?",
+                "Does this policy cover maternity expenses?"
+            ]
+        }
+        
+        test_response = {
+            "answers": [
+                "A grace period of thirty days is provided for premium payment after the due date.",
+                "There is a waiting period of thirty-six (36) months of continuous coverage for pre-existing diseases.",
+                "Yes, the policy covers maternity expenses with specific conditions and waiting periods."
+            ]
+        }
+        
+        return {
+            "message": "Hackathon API format validation",
+            "sample_request": test_request,
+            "sample_response": test_response,
+            "status": "API format compliant",
+            "endpoint": "/hackrx/run",
+            "method": "POST"
+        }
+        
+    except Exception as e:
+        logger.error(f"Error in test endpoint: {e}")
+        return {"error": str(e)}
+
+
 
 if __name__ == "__main__":
     uvicorn.run(
