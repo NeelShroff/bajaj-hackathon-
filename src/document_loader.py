@@ -58,10 +58,20 @@ class DocumentLoader:
     and enriches them with intelligent metadata for superior retrieval.
     """
     def __init__(self):
+        # Enhanced chunking strategy for policy documents
         self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=config.CHUNK_SIZE,
-            chunk_overlap=config.CHUNK_OVERLAP,
-            separators=["\n\n", "\n", ". ", " ", ""]
+            chunk_size=1200,  # Increased to preserve complete definitions
+            chunk_overlap=300,  # Increased overlap to maintain context
+            separators=[
+                "\n\n\n",  # Major section breaks
+                "\n\n",    # Paragraph breaks
+                "\n",      # Line breaks
+                ". ",      # Sentence breaks
+                "; ",      # Clause breaks
+                ", ",      # Phrase breaks
+                " ",       # Word breaks
+                ""
+            ]
         )
         self.supported_formats = {'.pdf', '.docx', '.doc', '.eml', '.msg', '.txt', '.csv', '.html', '.json', '.xlsx'}
         self.llm_client = OpenAI(api_key=config.OPENAI_API_KEY)
@@ -421,7 +431,8 @@ class DocumentLoader:
                 if not content:
                     continue
                 
-                chunks = self.text_splitter.split_text(content)
+                # Enhanced chunking with definition preservation
+                chunks = self._smart_chunk_with_definitions(content)
 
                 for i, chunk in enumerate(chunks):
                     documents.append(Document(page_content=chunk, metadata={
@@ -430,9 +441,53 @@ class DocumentLoader:
                         'section_type': section_type,
                         'chunk_index': i,
                         'source': f"{document_name}_{section_id}_{i}",
-                        'chunk_strategy': 'semantic_text'
+                        'chunk_strategy': 'definition_aware'
                     }))
         return documents
+
+    def _smart_chunk_with_definitions(self, content: str) -> List[str]:
+        """Smart chunking that preserves complete policy definitions and key facts."""
+        if not content.strip():
+            return []
+        
+        # First, identify and preserve complete definitions
+        definition_patterns = [
+            r'(\d+\.\d+\s+[A-Z][^\n]*?\s+means\s+[^\n]*?(?:\n[^\n]*?)*?)(?=\n\n|\n\d+\.\d+|$)',
+            r'([A-Z][^\n]*?\s+means\s+[^\n]*?(?:\n[^\n]*?)*?)(?=\n\n|\n[A-Z][^\n]*?\s+means|$)',
+            r'(\"[^\"]+\"\s+means\s+[^\n]*?(?:\n[^\n]*?)*?)(?=\n\n|\n\"[^\"]+\"|$)',
+            r'([A-Z][A-Z\s]+:\s*[^\n]*?(?:\n[^\n]*?)*?)(?=\n\n|\n[A-Z][A-Z\s]+:|$)'
+        ]
+        
+        preserved_definitions = []
+        remaining_content = content
+        
+        # Extract complete definitions first
+        for pattern in definition_patterns:
+            matches = re.finditer(pattern, remaining_content, re.MULTILINE | re.DOTALL)
+            for match in matches:
+                definition_text = match.group(1).strip()
+                if len(definition_text) > 50:  # Only preserve substantial definitions
+                    preserved_definitions.append(definition_text)
+                    # Remove from remaining content to avoid duplication
+                    remaining_content = remaining_content.replace(match.group(0), '', 1)
+        
+        # Clean up remaining content
+        remaining_content = re.sub(r'\n\s*\n\s*\n', '\n\n', remaining_content).strip()
+        
+        # Chunk the remaining content normally
+        regular_chunks = self.text_splitter.split_text(remaining_content) if remaining_content else []
+        
+        # Combine preserved definitions with regular chunks
+        all_chunks = preserved_definitions + regular_chunks
+        
+        # Filter out empty or very short chunks
+        final_chunks = [chunk.strip() for chunk in all_chunks if chunk.strip() and len(chunk.strip()) > 20]
+        
+        # If no chunks were created, fall back to regular splitting
+        if not final_chunks:
+            final_chunks = self.text_splitter.split_text(content)
+        
+        return final_chunks
 
     def _clean_column_name(self, column_name: str) -> str:
         """Clean and normalize column names for better readability."""

@@ -68,5 +68,5 @@ def debug_query_retrieval(query: str):
 
 if __name__ == "__main__":
     # The specific question you want to test
-    test_query = "What is the coverage limit for air ambulance services under Plan B?"
+    test_query = "Are there any sub-limits on room rent and ICU charges for Plan A?"
     debug_query_retrieval(test_query)

@@ -7,7 +7,7 @@ __pycache__/
 venv/
 
 # Environment variables
-
+.env
 # FAISS index files
 data/faiss_index.faiss
 data/faiss_index.pkl

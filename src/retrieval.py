@@ -473,6 +473,7 @@ INSTRUCTIONS:
    • All conditions, requirements, and limitations
    • Specific acts, regulations, or legal references
    • Important exceptions or qualifications
+   • TABLE INFORMATION: If any relevant information is found in tables (numerical values, sub-limits, percentages, specific amounts), include these exact details in your answer
 
 3. USE MOST ACCURATE INFORMATION: If you find conflicting details, use the most specific and authoritative version.
 

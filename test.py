@@ -82,4 +82,4 @@ if __name__ == '__main__':
     document_path = "data/policies/policy.pdf"
     
     # Run the debugger for the specific document and page
-    debug_specific_table_chunks(document_path, target_page=23)
+    debug_specific_table_chunks(document_path, target_page=22)
