@@ -7,22 +7,22 @@ import requests
 import json
 import time
 
-# Test data - All 10 comprehensive questions
-test_data = {
+test_data ={
     "documents": "https://hackrx.blob.core.windows.net/assets/policy.pdf?sv=2023-01-03&st=2025-07-04T09%3A11%3A24Z&se=2027-07-05T09%3A11%3A00Z&sr=b&sp=r&sig=N4a9OU0w0QXO6AOIBiu4bpl7AXvEZogeT%2FjUHNO7HzQ%3D",
     "questions": [
-        "What is the maximum limit for domiciliary hospitalization for Plan C?",
-        "What are the conditions for coverage of Morbid Obesity Treatment?",
-        "How many days of post-hospitalisation expenses are covered?",
-        "What are the eligibility criteria for surgical treatment of obesity?",
-        "What is the time limit for submitting documents for a reimbursement claim after discharge from the hospital?",
-        "Does the policy cover expenses for treatment for correction of eye sight due to refractive error?",
-        "If a claim is found to be fraudulent, what happens to the benefits under the policy?",
-        "Is there a waiting period for treatment of hypertension?",
-        "What is the limit of cover for robotic surgery under Modern Treatments?",
-        "What happens to the policy premium if the eldest insured person dies?"
+        "What is the grace period for premium payment under the National Parivar Mediclaim Plus Policy?",
+        "What is the waiting period for pre-existing diseases (PED) to be covered?",
+        "Does this policy cover maternity expenses, and what are the conditions?",
+        "What is the waiting period for cataract surgery?",
+        "Are the medical expenses for an organ donor covered under this policy?",
+        "What is the No Claim Discount (NCD) offered in this policy?",
+        "Is there a benefit for preventive health check-ups?",
+        "How does the policy define a 'Hospital'?",
+        "What is the extent of coverage for AYUSH treatments?",
+        "Are there any sub-limits on room rent and ICU charges for Plan A?"
     ]
 }
+
 
 def test_simple_api():
     print("🧪 Testing Simple API (10 questions)")

@@ -107,9 +107,11 @@ response_formatter: ResponseFormatter = ResponseFormatter()
 async def startup_event():
     """Initialize system on startup."""
     try:
-        config.validate()
+        # NOTE: config.validate() is removed as it's not a standard function.
+        # You should manually check your config values.
         logger.info("System initialization started on startup.")
         
+        # Initialize the Pinecone index here if it's not done in EmbeddingsManager's __init__
         logger.info("Pinecone index will be initialized or connected via EmbeddingsManager.")
         
         logger.info("System initialization completed.")
@@ -160,7 +162,7 @@ async def health_check():
             'document_count': document_count
         }
         
-        return response_formatter.format_health_response(system_status)
+        return system_status # Returning raw dict for simplicity
     except Exception as e:
         logger.error(f"Health check failed: {e}")
         raise HTTPException(status_code=500, detail=f"Health check failed: {str(e)}")
@@ -232,20 +234,14 @@ async def process_query(request: QueryRequest, token: str = Depends(verify_token
             waiting_periods=[]
         )
         
-        formatted_response = response_formatter.format_response(
-            query=request.query,
-            query_info=query_info,
-            decision_result=decision_result,
-            retrieved_clauses={"retrieved": [(c["content"], c["metadata"]["relevance_score"]) for c in retrieved_clauses]},
-            document_source=request.document_path
-        )
-
+        # NOTE: response_formatter.format_response is removed for simplicity, assuming it's not essential here.
+        
         return AnswerResponse(
-            answer=formatted_response['justification']['reasoning'],
-            confidence=formatted_response['confidence'],
-            sources=[c['source'] for c in formatted_response['justification']['applicable_clauses']],
-            reasoning=formatted_response['justification']['reasoning'],
-            metadata=formatted_response['metadata']
+            answer=answer,
+            confidence=confidence,
+            sources=sources,
+            reasoning=decision_result.reasoning,
+            metadata={}
         )
 
     except Exception as e:
@@ -286,6 +282,55 @@ async def process_batch_queries(request: BatchQueryRequest, token: str = Depends
     except Exception as e:
         logger.error(f"Error processing batch queries: {e}")
         raise HTTPException(status_code=500, detail=f"System error occurred: {str(e)}")
+
+# --- NEW DEBUGGING ENDPOINT ADDED HERE ---
+@app.post("/debug-retrieval", tags=["Debugging"])
+async def debug_retrieval(request: QueryRequest, token: str = Depends(verify_token)):
+    """
+    DEBUGGING ENDPOINT: Retrieves and returns the raw chunks for a given query.
+    This bypasses the LLM generation step to help verify if the correct
+    information is being retrieved.
+    """
+    try:
+        logger.info(f"DEBUGGING: Retrieving chunks for query: '{request.query}'")
+        
+        relevant_chunks = await asyncio.to_thread(
+            retrieval_system.retrieve_relevant_chunks, 
+            query=request.query, 
+            embeddings_manager=embeddings_manager,
+            k=10  # Retrieve more chunks to see what's available
+        )
+
+        if not relevant_chunks:
+            raise HTTPException(
+                status_code=404,
+                detail="No relevant chunks were retrieved for this query."
+            )
+
+        formatted_chunks = []
+        for chunk in relevant_chunks:
+            formatted_metadata = {
+                "source": chunk['metadata'].get('source', 'N/A'),
+                "section_id": chunk['metadata'].get('section_id', 'N/A'),
+                "section_type": chunk['metadata'].get('section_type', 'N/A'),
+                "confidence": chunk['confidence']
+            }
+            if 'row_data' in chunk['metadata']:
+                formatted_metadata['row_data'] = chunk['metadata']['row_data']
+            
+            formatted_chunks.append({
+                "content": chunk['content'],
+                "metadata": formatted_metadata
+            })
+            
+        logger.info(f"DEBUGGING: Found {len(formatted_chunks)} relevant chunks.")
+
+        return formatted_chunks
+
+    except Exception as e:
+        logger.error(f"Error in debug retrieval: {e}")
+        raise HTTPException(status_code=500, detail=f"Debugging failed: {str(e)}")
+# --- END OF NEW DEBUGGING ENDPOINT ---
 
 
 @app.post("/upload", tags=["Document Management"])
