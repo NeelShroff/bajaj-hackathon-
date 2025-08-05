@@ -3,13 +3,24 @@ import numpy as np
 from typing import List, Dict, Any, Tuple
 from langchain.schema import Document
 from functools import lru_cache
-from openai import OpenAI
 import asyncio
+from openai import OpenAI
+from config import config
+import tiktoken
 
 from .embeddings import EmbeddingsManager
 from config import config
 
 logger = logging.getLogger(__name__)
+
+def count_tokens(text: str, model: str = "gpt-3.5-turbo") -> int:
+    """Count tokens in text using tiktoken."""
+    try:
+        encoding = tiktoken.encoding_for_model(model)
+        return len(encoding.encode(text))
+    except Exception:
+        # Fallback: rough estimate (1 token ≈ 4 characters)
+        return len(text) // 4
 
 class RetrievalSystem:
     def __init__(self):
@@ -427,8 +438,20 @@ class RetrievalSystem:
     
     async def retrieve_and_generate_answer_async(self, query: str, embeddings_manager: EmbeddingsManager) -> Tuple[str, List[str], float]:
         try:
+            # Initialize token tracking
+            token_usage = {
+                'embedding_tokens': 0,
+                'llm_input_tokens': 0,
+                'llm_output_tokens': 0,
+                'total_tokens': 0
+            }
+            
             # Expand query for better retrieval
             expanded_queries = self._expand_query_for_better_retrieval(query)
+            
+            # Track embedding tokens for all queries
+            for eq in expanded_queries:
+                token_usage['embedding_tokens'] += count_tokens(eq, "text-embedding-ada-002")
             
             # Retrieve chunks for all expanded queries
             all_chunks = []
@@ -489,6 +512,9 @@ FORMAT EXAMPLES:
 Answer:
 """
 
+            # Track LLM input tokens
+            token_usage['llm_input_tokens'] = count_tokens(prompt, config.OPENAI_MODEL)
+            
             client = OpenAI(api_key=config.OPENAI_API_KEY)
             response = await asyncio.to_thread(
                 client.chat.completions.create,
@@ -500,6 +526,24 @@ Answer:
             )
 
             answer = response.choices[0].message.content.strip()
+            
+            # Track LLM output tokens
+            token_usage['llm_output_tokens'] = count_tokens(answer, config.OPENAI_MODEL)
+            
+            # Calculate total tokens
+            token_usage['total_tokens'] = (
+                token_usage['embedding_tokens'] + 
+                token_usage['llm_input_tokens'] + 
+                token_usage['llm_output_tokens']
+            )
+            
+            # Log comprehensive token usage
+            logger.info(f"🔢 TOKEN USAGE - Query: '{query[:50]}...'")
+            logger.info(f"   📊 Embedding tokens: {token_usage['embedding_tokens']}")
+            logger.info(f"   📥 LLM input tokens: {token_usage['llm_input_tokens']}")
+            logger.info(f"   📤 LLM output tokens: {token_usage['llm_output_tokens']}")
+            logger.info(f"   💰 TOTAL tokens: {token_usage['total_tokens']}")
+            
             confidence = max([c.get('confidence', 0.0) for c in relevant_chunks])
             sources = [c['metadata'].get('source', 'Unknown') for c in relevant_chunks]
 
