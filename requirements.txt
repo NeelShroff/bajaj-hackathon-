@@ -41,8 +41,8 @@ aiofiles>=23.0.0,<24.0.0
 # Logging and monitoring
 structlog>=23.0.0,<24.0.0
 
-# Optional: Advanced document processing (commented out to reduce build time)
-# camelot-py[cv]>=0.10.1,<1.0.0
-# unstructured>=0.10.0,<1.0.0
-# pytesseract>=0.3.10,<1.0.0
-# pdf2image>=3.1.0,<4.0.0
+# Optional: Advanced document processing
+camelot-py[cv]>=0.10.1,<1.0.0
+unstructured>=0.10.0,<1.0.0
+pytesseract>=0.3.10,<1.0.0
+pdf2image>=3.1.0,<4.0.0
