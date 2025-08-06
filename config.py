@@ -7,7 +7,7 @@ class Config:
     """Configuration class for the document processing system."""
     
     OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "YOUR_OPENAI_API_KEY_HERE")
-    OPENAI_MODEL: str = "gpt-3.5-turbo"
+    OPENAI_MODEL: str = "gpt-4o-mini"
     EMBEDDING_MODEL: str = "text-embedding-3-small"
     
     PINECONE_API_KEY: str = os.getenv("PINECONE_API_KEY", "YOUR_PINECONE_API_KEY_HERE")
@@ -18,10 +18,16 @@ class Config:
     PROCESSED_DOCS_PATH: str = "./data/processed"
     
     LOG_LEVEL: str = "INFO"
-    CHUNK_SIZE: int = 1200  # Increased from 500 to preserve complete policy sections
-    CHUNK_OVERLAP: int = 300  # Increased from 100 to 300 for better context preservation
-    TOP_K_RESULTS: int = 8    # Increased from 4 to get more comprehensive context
+    CHUNK_SIZE: int = 1200  # Smaller chunks to prevent token limit issues
+    CHUNK_OVERLAP: int = 300  # Increased overlap for better context preservation
+    TOP_K_RESULTS: int = 6    # Reduced to fit within context window of gpt-3.5-turbo
     SIMILARITY_THRESHOLD: float = 0.5
+    
+    # Performance optimization settings
+    MAX_EMBEDDING_BATCH_SIZE: int = 100  # Larger batches for better API efficiency
+    MAX_CONCURRENT_EMBEDDINGS: int = 5   # Control concurrent API calls
+    PINECONE_BATCH_SIZE: int = 100       # Optimize Pinecone upsert batch size
+    ENABLE_DOCUMENT_CACHING: bool = True # Cache processed documents
     
     @classmethod
     def validate(cls) -> None:

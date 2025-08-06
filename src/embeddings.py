@@ -12,16 +12,20 @@ from pinecone import Pinecone, ServerlessSpec
 import uuid
 import json
 import sys
+from functools import lru_cache
+import hashlib
 
 from config import config
 
+# Configure logging
 logger = logging.getLogger(__name__)
-
-# Load tokenizer for token counting
 TOKEN_ENCODING = get_encoding("cl100k_base")
 
 class EmbeddingsManager:
-    """Manages OpenAI embeddings and Pinecone index for document retrieval."""
+    """
+    Manages OpenAI embeddings and Pinecone index for document retrieval.
+    Optimized for high-speed, parallel upsertion with cost efficiency.
+    """
     
     def __init__(self):
         self.client = OpenAI(api_key=config.OPENAI_API_KEY)
@@ -37,8 +41,11 @@ class EmbeddingsManager:
         self.documents = []
         self.dimension = 1536
         
+        # --- OPTIMIZATION: More aggressive batch sizes ---
+        # Pinecone's serverless payload limit is ~4MB, so 3.5MB is a safe buffer
         self.MAX_PAYLOAD_SIZE = 3.5 * 1024 * 1024
-        self.MAX_VECTORS_PER_BATCH = 100
+        self.MAX_VECTORS_PER_BATCH = 5000
+        self.MAX_CONCURRENT_UPSERTS = 10
         
         self.initialize_index()
 
@@ -47,9 +54,7 @@ class EmbeddingsManager:
         index_name = config.PINECONE_INDEX_NAME
         
         try:
-            existing_indexes = []
-            for index in self.pinecone.list_indexes():
-                existing_indexes.append(index.name)
+            existing_indexes = [index.name for index in self.pinecone.list_indexes()]
             
             if index_name not in existing_indexes:
                 logger.info(f"Creating Pinecone index '{index_name}'...")
@@ -67,6 +72,19 @@ class EmbeddingsManager:
             logger.error(f"Error initializing Pinecone index: {e}")
             raise
 
+    @lru_cache(maxsize=1000)
+    def _cached_create_embedding(self, text_hash: str, text: str) -> List[float]:
+        """Create embedding with caching for single synchronous queries."""
+        try:
+            response = self.client.embeddings.create(
+                model=config.EMBEDDING_MODEL,
+                input=[text]
+            )
+            return response.data[0].embedding
+        except Exception as e:
+            logger.error(f"Error creating embedding: {e}")
+            raise
+
     async def _async_create_embeddings_api_call(self, texts: List[str]) -> List[List[float]]:
         """Create embeddings for a list of texts using OpenAI API asynchronously."""
         try:
@@ -79,47 +97,34 @@ class EmbeddingsManager:
             logger.error(f"Error creating embeddings: {e}")
             raise
 
-    async def _async_batch_create_embeddings(self, documents: List[Document], max_tokens_per_batch: int = 8191) -> Tuple[List[Tuple], List[Document]]:
+    async def _async_batch_create_embeddings(self, documents: List[Document], max_tokens_per_batch: int = 30000) -> Tuple[List[Tuple], List[Document]]:
         """
-        Creates embeddings in dynamic batches, handling oversized chunks by splitting them.
+        Creates embeddings from a list of pre-chunked documents in dynamic batches.
+        Optimized for concurrency and API token limits.
         """
-        all_embeddings_vectors = []
-        processed_documents = []
-        
-        pre_processed_docs = []
-        for doc in documents:
-            text = doc.page_content
-            text_tokens = len(TOKEN_ENCODING.encode(text))
-            
-            if text_tokens > max_tokens_per_batch:
-                logger.warning(f"Chunk from doc '{doc.metadata.get('document_name', 'N/A')}' with {text_tokens} tokens exceeds API limit. Splitting.")
-                sub_chunks = self._split_and_batch_text(text, max_tokens=max_tokens_per_batch)
-                
-                for i, sub_chunk in enumerate(sub_chunks):
-                    sub_chunk_doc = Document(
-                        page_content=sub_chunk,
-                        metadata={**doc.metadata, 'sub_chunk_index': i}
-                    )
-                    pre_processed_docs.append(sub_chunk_doc)
-            else:
-                pre_processed_docs.append(doc)
-
         batches_to_process = []
         current_batch_texts = []
         current_batch_docs = []
         current_batch_tokens = 0
-        for doc in pre_processed_docs:
+        for doc in documents:
             text = doc.page_content
+            if not isinstance(text, str):
+                logger.warning(f"Skipping document with non-string content: {type(text)}")
+                continue
+
             text_tokens = len(TOKEN_ENCODING.encode(text))
-            if current_batch_tokens + text_tokens <= max_tokens_per_batch:
+            
+            if current_batch_tokens + text_tokens <= max_tokens_per_batch and len(current_batch_texts) < 2048:
                 current_batch_texts.append(text)
                 current_batch_docs.append(doc)
                 current_batch_tokens += text_tokens
             else:
-                batches_to_process.append({'texts': current_batch_texts, 'docs': current_batch_docs})
+                if current_batch_texts:
+                    batches_to_process.append({'texts': current_batch_texts, 'docs': current_batch_docs})
                 current_batch_texts = [text]
                 current_batch_docs = [doc]
                 current_batch_tokens = text_tokens
+                
         if current_batch_texts:
             batches_to_process.append({'texts': current_batch_texts, 'docs': current_batch_docs})
 
@@ -150,17 +155,22 @@ class EmbeddingsManager:
         sample_json = json.dumps(sample_vector)
         sample_size = len(sample_json.encode('utf-8'))
         
-        estimated_size = len(vectors) * sample_size + 1000
+        estimated_size = len(vectors) * sample_size
         return estimated_size
 
     def _split_vectors_by_payload_size(self, vectors: List[Tuple]) -> List[List[Tuple]]:
-        """Split vectors into batches that respect Pinecone's payload size limit."""
+        """
+        OPTIMIZATION: Split vectors into batches that are intelligently sized
+        to respect Pinecone's payload size limit.
+        """
         batches = []
         current_batch = []
         
         for vector in vectors:
             test_batch = current_batch + [vector]
             
+            # The key is to check the size and count *before* adding the next vector
+            # This logic avoids creating a batch that's already too big
             if (len(test_batch) > self.MAX_VECTORS_PER_BATCH or 
                 self._estimate_payload_size(test_batch) > self.MAX_PAYLOAD_SIZE):
                 
@@ -168,9 +178,9 @@ class EmbeddingsManager:
                     batches.append(current_batch)
                     current_batch = [vector]
                 else:
-                    logger.warning(f"Vector {vector[0]} too large, truncating metadata")
-                    truncated_vector = self._truncate_vector_metadata(vector)
-                    batches.append([truncated_vector])
+                    logger.warning(f"Vector {vector[0]} is too large for a single batch even with metadata truncation.")
+                    # Fallback for extremely large single vectors
+                    batches.append([self._truncate_vector_metadata(vector)])
             else:
                 current_batch = test_batch
         
@@ -183,11 +193,10 @@ class EmbeddingsManager:
         """Truncate vector metadata to fit within size limits."""
         vector_id, embedding, metadata = vector
         
-        # Keep only essential metadata, now including the LLM-derived 'section_type'
         essential_metadata = {
             'document_name': metadata.get('document_name', ''),
             'section_id': metadata.get('section_id', ''),
-            'section_type': metadata.get('section_type', ''), # NEW: Use the AI-derived section type
+            'section_type': metadata.get('section_type', ''),
             'chunk_index': metadata.get('chunk_index', 0),
             'source': metadata.get('source', ''),
         }
@@ -200,24 +209,16 @@ class EmbeddingsManager:
         
         return (vector_id, embedding, essential_metadata)
 
-    def _split_and_batch_text(self, text: str, max_tokens: int = 8191) -> List[str]:
-        """Splits a large string into smaller parts based on token count."""
-        tokens = TOKEN_ENCODING.encode(text)
-        sub_chunks = []
-        for i in range(0, len(tokens), max_tokens):
-            sub_chunk_tokens = tokens[i:i + max_tokens]
-            sub_chunks.append(TOKEN_ENCODING.decode(sub_chunk_tokens))
-        return sub_chunks
-    
     def create_embedding(self, text: str) -> List[float]:
         """Create embedding for a single text."""
-        return self.client.embeddings.create(
-            model=config.EMBEDDING_MODEL,
-            input=[text]
-        ).data[0].embedding
+        query_hash = hashlib.md5(text.encode()).hexdigest()
+        return self._cached_create_embedding(query_hash, text)
     
     async def build_index_async(self, documents: List[Document]) -> None:
-        """Build Pinecone index by upserting document vectors in properly sized batches."""
+        """
+        Build Pinecone index by upserting document vectors in parallel batches.
+        Uses a semaphore to manage concurrency and avoid rate limits.
+        """
         if not documents:
             logger.warning("No documents provided for indexing")
             return
@@ -226,15 +227,30 @@ class EmbeddingsManager:
         
         vectors_to_upsert, self.documents = await self._async_batch_create_embeddings(documents)
         
+        vectors_to_upsert = [v for v in vectors_to_upsert if v[1] and isinstance(v[1], list) and len(v[1]) == self.dimension]
+        
         vector_batches = self._split_vectors_by_payload_size(vectors_to_upsert)
         
         logger.info(f"Upserting {len(vectors_to_upsert)} vectors in {len(vector_batches)} batches.")
+
+        # --- CORRECTED OPTIMIZATION: Use a semaphore to limit concurrent upsert tasks ---
+        # A semaphore limits the number of concurrent tasks to avoid overwhelming the API.
+        semaphore = asyncio.Semaphore(self.MAX_CONCURRENT_UPSERTS)
+
+        async def upsert_batch(batch: List[Tuple]):
+            async with semaphore:
+                try:
+                    # Use asyncio.to_thread to run the blocking upsert call
+                    # This makes the main event loop non-blocking
+                    await asyncio.to_thread(self.index.upsert, vectors=batch)
+                    logger.debug(f"Successfully upserted a batch of {len(batch)} vectors.")
+                except Exception as e:
+                    logger.error(f"Failed to upsert batch: {e}")
         
-        upsert_tasks = []
-        for i, batch in enumerate(vector_batches):
-            upsert_task = asyncio.to_thread(self.index.upsert, vectors=batch)
-            upsert_tasks.append(upsert_task)
-            
+        # Create a list of all the upsert tasks
+        upsert_tasks = [upsert_batch(batch) for batch in vector_batches]
+        
+        # Run all tasks concurrently and wait for them to finish
         await asyncio.gather(*upsert_tasks)
         
         logger.info(f"Pinecone index build completed.")
@@ -247,7 +263,8 @@ class EmbeddingsManager:
         if k is None:
             k = config.TOP_K_RESULTS
         
-        query_embedding = self.create_embedding(query)
+        query_hash = hashlib.md5(query.encode()).hexdigest()
+        query_embedding = self._cached_create_embedding(query_hash, query)
         
         results = self.index.query(
             vector=query_embedding,
@@ -257,8 +274,13 @@ class EmbeddingsManager:
         
         search_results = []
         for match in results.matches:
+            text_content = match.metadata.get('text', '')
+            if not isinstance(text_content, str):
+                logger.warning(f"Skipping non-string content from Pinecone match: {type(text_content)}")
+                continue
+
             doc = Document(
-                page_content=match.metadata.get('text', ''),
+                page_content=text_content,
                 metadata=match.metadata
             )
             search_results.append((doc, match.score))

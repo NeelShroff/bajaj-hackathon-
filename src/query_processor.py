@@ -2,153 +2,53 @@ import re
 import logging
 from typing import Dict, Any, Optional, List
 from dataclasses import dataclass
-from openai import OpenAI
+from openai import OpenAI, AsyncOpenAI
 
 from config import config
 
 logger = logging.getLogger(__name__)
 
+# Use async version of LLM client
+async_llm_client = AsyncOpenAI(api_key=config.OPENAI_API_KEY)
+
 @dataclass
 class QueryEntities:
     """Structured representation of extracted query entities."""
-    age: Optional[int] = None
-    gender: Optional[str] = None
-    procedure: Optional[str] = None
-    location: Optional[str] = None
-    policy_duration: Optional[str] = None
+    key_entities: List[str] = None
+    constraints: Dict[str, Any] = None
     query_type: Optional[str] = None
-    conditions: List[str] = None
-    amounts: List[float] = None
     
     def __post_init__(self):
-        if self.conditions is None:
-            self.conditions = []
-        if self.amounts is None:
-            self.amounts = []
+        if self.key_entities is None:
+            self.key_entities = []
+        if self.constraints is None:
+            self.constraints = {}
 
 class QueryProcessor:
     """Processes natural language queries and extracts structured information."""
     
     def __init__(self):
-        self.client = OpenAI(api_key=config.OPENAI_API_KEY)
-        
-        self.age_pattern = r'(\d{1,3})(?:M|F|Male|Female|MALE|FEMALE)'
-        self.gender_pattern = r'(\d{1,3})(M|F|Male|Female|MALE|FEMALE)'
-        self.location_pattern = r'\b(Mumbai|Delhi|Bangalore|Chennai|Kolkata|Pune|Hyderabad|Ahmedabad|Jaipur|Lucknow|Kanpur|Nagpur|Indore|Thane|Bhopal|Visakhapatnam|Pimpri-Chinchwad|Patna|Vadodara|Ghaziabad|Ludhiana|Agra|Nashik|Faridabad|Meerut|Rajkot|Kalyan-Dombivali|Vasai-Virar|Varanasi|Srinagar|Aurangabad|Dhanbad|Amritsar|Allahabad|Ranchi|Howrah|Coimbatore|Jabalpur|Gwalior|Vijayawada|Jodhpur|Madurai|Raipur|Kota|Guwahati|Chandigarh|Solapur|Tiruchirappalli|Bareilly|Moradabad|Mysore|Tiruppur|Gurgaon|Aligarh|Jalandhar|Bhubaneswar|Salem|Warangal|Guntur|Bhiwandi|Saharanpur|Gorakhpur|Bikaner|Amravati|Noida|Jamshedpur|Bhilai|Cuttack|Firozabad|Kochi|Nellore|Bhavnagar|Dehradun|Durgapur|Asansol|Rourkela|Nanded|Kolhapur|Ajmer|Akola|Gulbarga|Jamnagar|Ujjain|Loni|Siliguri|Jhansi|Ulhasnagar|Jammu|Sangli-Miraj|Mangalore|Erode|Belgaum|Ambattur|Tirunelveli|Malegaon|Gaya|Jalgaon|Udaipur|Maheshtala|Tirupur|Davanagere|Kozhikode|Kurnool|Rajpur|Sonarpur|Bokaro|South|Dum|Dum|Durg|Raj|Nagar|Bihar|Sharif|Panihati|Satara|Bijapur|Brahmapur|Shahjahanpur|Bidar|Gandhidham|Baranagar|Tiruvottiyur|Puducherry|Sikar|Thrissur|Alwar|Bahraich|Phusro|Vellore|Mehsana|Raebareli|Chittoor|Gwalior|Bhilwara|Gandhinagar|Bharatpur|Sikar|Panipat|Fatehpur|Budhana|Okara|Sanand|Tonk|Gangtok|Faizabad|Muktsar|Khanna|Yavatmal|Dhule|Korba|Bokaro|Steel|City|Raj|Nagar|Bihar|Sharif|Panihati|Satara|Bijapur|Brahmapur|Shahjahanpur|Bidar|Gandhidham|Baranagar|Tiruvottiyur|Puducherry|Sikar|Thrissur|Alwar|Bahraich|Phusro|Vellore|Mehsana|Raebareli|Chittoor|Gwalior|Bhilwara|Gandhinagar|Bharatpur|Sikar|Panipat|Fatehpur|Budhana|Okara|Sanand|Tonk|Gangtok|Faizabad|Muktsar|Khanna|Yavatmal|Dhule|Korba|Bokaro|Steel|City)\b'
-        self.duration_pattern = r'(\d+)\s*(month|year|day)s?'
-        self.amount_pattern = r'(\d+(?:,\d+)*(?:\.\d+)?)\s*(?:rs|rupees?|inr|₹)?'
-        
-    def extract_entities(self, query: str) -> QueryEntities:
-        """Extract structured entities from natural language query."""
-        query_lower = query.lower()
-        entities = QueryEntities()
-        
-        age_gender_match = re.search(self.gender_pattern, query, re.IGNORECASE)
-        if age_gender_match:
-            entities.age = int(age_gender_match.group(1))
-            gender = age_gender_match.group(2).upper()
-            entities.gender = 'male' if gender in ['M', 'MALE'] else 'female'
-        
-        location_match = re.search(self.location_pattern, query, re.IGNORECASE)
-        if location_match:
-            entities.location = location_match.group(1)
-        
-        duration_match = re.search(self.duration_pattern, query_lower)
-        if duration_match:
-            entities.policy_duration = f"{duration_match.group(1)} {duration_match.group(2)}s"
-        
-        amount_matches = re.findall(self.amount_pattern, query, re.IGNORECASE)
-        for amount_str in amount_matches:
-            try:
-                amount = float(amount_str.replace(',', ''))
-                entities.amounts.append(amount)
-            except ValueError:
-                continue
-        
-        entities.procedure = self._extract_procedure(query)
-        
-        entities.query_type = self._determine_query_type(query)
-        
-        entities.conditions = self._extract_conditions(query)
-        
-        return entities
+        # We don't need a separate client here as we'll use the async one globally.
+        pass
     
-    def _extract_procedure(self, query: str) -> Optional[str]:
-        """Extract medical procedure or treatment from query."""
-        procedures = [
-            'knee surgery', 'heart surgery', 'dental treatment', 'maternity',
-            'hospitalization', 'emergency', 'accident', 'pre-existing',
-            'disease', 'illness', 'surgery', 'treatment', 'therapy',
-            'medication', 'prescription', 'consultation', 'diagnosis',
-            'x-ray', 'mri', 'ct scan', 'ultrasound', 'blood test',
-            'vaccination', 'immunization', 'physiotherapy', 'occupational therapy'
-        ]
-        
-        query_lower = query.lower()
-        for procedure in procedures:
-            if procedure in query_lower:
-                return procedure
-        
-        return None
-    
-    def _determine_query_type(self, query: str) -> str:
-        """Determine the type of query being asked."""
-        query_lower = query.lower()
-        
-        if any(word in query_lower for word in ['cover', 'coverage', 'covered']):
-            return 'coverage_check'
-        elif any(word in query_lower for word in ['amount', 'limit', 'maximum', 'sum']):
-            return 'amount_inquiry'
-        elif any(word in query_lower for word in ['waiting', 'period', 'time']):
-            return 'waiting_period'
-        elif any(word in query_lower for word in ['exclude', 'exclusion', 'not cover']):
-            return 'exclusion_check'
-        elif any(word in query_lower for word in ['network', 'hospital', 'provider']):
-            return 'provider_inquiry'
-        else:
-            return 'general_inquiry'
-    
-    def _extract_conditions(self, query: str) -> List[str]:
-        """Extract conditions or modifiers from query."""
-        conditions = []
-        query_lower = query.lower()
-        
-        condition_keywords = [
-            'emergency', 'accident', 'pre-existing', 'chronic',
-            'acute', 'elective', 'planned', 'unplanned',
-            'network', 'non-network', 'cashless', 'reimbursement',
-            'day care', 'in-patient', 'out-patient', 'domiciliary'
-        ]
-        
-        for condition in condition_keywords:
-            if condition in query_lower:
-                conditions.append(condition)
-        
-        return conditions
-    
-    def enhance_query_with_llm(self, query: str) -> Dict[str, Any]:
-        """Use LLM to enhance query understanding and extraction."""
+    async def _enhance_query_with_llm(self, query: str) -> Dict[str, Any]:
+        """Use LLM to perform a universal query analysis and extraction."""
         try:
             prompt = f"""
-            Analyze the following insurance policy query and extract structured information:
-            
+            Analyze the following query and extract structured information. The query could be about any document (e.g., policy, contract, legal text, HR handbook).
+
             Query: "{query}"
-            
+
             Please extract and return a JSON object with the following fields:
-            - age: numeric age if mentioned
-            - gender: "male", "female", or null
-            - procedure: medical procedure/treatment mentioned
-            - location: city/location if mentioned
-            - policy_duration: policy duration if mentioned
-            - query_type: "coverage_check", "amount_inquiry", "waiting_period", "exclusion_check", "provider_inquiry", or "general_inquiry"
-            - conditions: list of conditions/modifiers (emergency, pre-existing, network, etc.)
-            - amounts: list of monetary amounts mentioned
-            - confidence: confidence score (0-1) for the extraction
-            
-            Return only the JSON object, no additional text.
+            - key_entities: list of main subjects or concepts (e.g., 'knee surgery', 'maternity', 'contract termination').
+            - constraints: A dictionary of key-value pairs representing conditions or limitations. Identify any dates, durations, amounts, locations, or specific requirements. For a query like "46-year-old male, Pune, 3-month-old policy," constraints would be {{'age': 46, 'gender': 'male', 'location': 'Pune', 'policy_duration': '3 months'}}.
+            - query_type: A single label describing the user's intent, such as "coverage_check", "amount_inquiry", "eligibility_check", "definition_lookup", "procedure_guide", or "general_inquiry".
+            - confidence: a confidence score (0-1) for the extraction.
+
+            Return only the JSON object, no additional text or conversational phrases.
             """
             
-            response = self.client.chat.completions.create(
+            response = await async_llm_client.chat.completions.create(
                 model=config.OPENAI_MODEL,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.1,
@@ -156,83 +56,89 @@ class QueryProcessor:
             )
             
             import json
-            result = json.loads(response.choices[0].message.content)
-            return result
+            llm_response = response.choices[0].message.content.strip()
+            if not llm_response:
+                logger.warning("LLM returned empty response")
+                return self._get_default_query_result()
+            
+            if llm_response.startswith('```json'):
+                llm_response = llm_response[7:]
+            if llm_response.startswith('```'):
+                llm_response = llm_response[3:]
+            if llm_response.endswith('```'):
+                llm_response = llm_response[:-3]
+            
+            try:
+                result = json.loads(llm_response)
+                if not isinstance(result, dict):
+                    logger.warning("LLM response is not a dictionary")
+                    return self._get_default_query_result()
+                
+                required_fields = ['key_entities', 'constraints', 'query_type', 'confidence']
+                for field in required_fields:
+                    if field not in result:
+                        result[field] = [] if field == 'key_entities' else {} if field == 'constraints' else 'general_inquiry' if field == 'query_type' else 0.5
+                
+                return result
+            except json.JSONDecodeError as e:
+                logger.error(f"JSON parsing failed: {e}. Response content: {llm_response[:100]}...")
+                return self._get_default_query_result()
             
         except Exception as e:
             logger.error(f"Error enhancing query with LLM: {e}")
-            entities = self.extract_entities(query)
-            return {
-                "age": entities.age,
-                "gender": entities.gender,
-                "procedure": entities.procedure,
-                "location": entities.location,
-                "policy_duration": entities.policy_duration,
-                "query_type": entities.query_type,
-                "conditions": entities.conditions,
-                "amounts": entities.amounts,
-                "confidence": 0.7
-            }
+            return self._get_default_query_result()
+            
+    def _get_default_query_result(self) -> Dict[str, Any]:
+        """Return a default query result structure when LLM enhancement fails."""
+        return {
+            "key_entities": [],
+            "constraints": {},
+            "query_type": "general_inquiry",
+            "confidence": 0.5
+        }
     
-    def create_search_queries(self, entities: QueryEntities) -> List[str]:
-        """Create multiple search queries for better retrieval."""
-        queries = []
+    def create_search_queries(self, query: str, enhanced_result: Dict[str, Any]) -> List[str]:
+        """Dynamically create search queries based on the LLM's structured output."""
+        queries = [query]
         
-        base_query_parts = []
-        if entities.procedure:
-            base_query_parts.append(entities.procedure)
-        if entities.age:
-            base_query_parts.append(f"{entities.age} year old")
-        if entities.gender:
-            base_query_parts.append(entities.gender)
-        if entities.location:
-            base_query_parts.append(entities.location)
+        entities = enhanced_result.get('key_entities', [])
+        constraints = enhanced_result.get('constraints', {})
+        query_type = enhanced_result.get('query_type', 'general_inquiry')
         
+        base_query_parts = entities + [f"{k}: {v}" for k, v in constraints.items() if v]
         if base_query_parts:
             queries.append(" ".join(base_query_parts))
+
+        if query_type == 'coverage_check' and entities:
+            queries.append(f"coverage for {', '.join(entities)}")
         
-        if entities.procedure:
-            queries.append(f"coverage {entities.procedure}")
-            queries.append(f"benefits {entities.procedure}")
+        if query_type == 'amount_inquiry' and entities:
+            queries.append(f"limit for {', '.join(entities)}")
+            
+        if query_type == 'eligibility_check' and entities:
+            queries.append(f"conditions for {', '.join(entities)}")
         
-        if entities.procedure:
-            queries.append(f"exclusions {entities.procedure}")
-        
-        if entities.procedure:
-            queries.append(f"waiting period {entities.procedure}")
-        
-        if entities.procedure:
-            queries.append(f"amount limit {entities.procedure}")
-            queries.append(f"maximum coverage {entities.procedure}")
-        
-        return queries
-    
-    def process_query(self, query: str) -> Dict[str, Any]:
-        """Main method to process a query and return structured information."""
+        if not entities and not constraints:
+            queries.append(query.lower())
+
+        return list(dict.fromkeys(queries))
+
+    async def process_query(self, query: str) -> Dict[str, Any]:
+        """Main method to process a query and return structured information and search queries."""
         logger.info(f"Processing query: {query}")
         
-        entities = self.extract_entities(query)
+        # Use LLM to extract entities and query type in a general way
+        enhanced_result = await self._enhance_query_with_llm(query)
         
-        enhanced_result = self.enhance_query_with_llm(query)
-        
-        search_queries = self.create_search_queries(entities)
+        # Dynamically generate search queries from the LLM's output
+        search_queries = self.create_search_queries(query, enhanced_result)
         
         return {
             "original_query": query,
-            "entities": {
-                "age": entities.age,
-                "gender": entities.gender,
-                "procedure": entities.procedure,
-                "location": entities.location,
-                "policy_duration": entities.policy_duration,
-                "query_type": entities.query_type,
-                "conditions": entities.conditions,
-                "amounts": entities.amounts
-            },
             "enhanced_extraction": enhanced_result,
             "search_queries": search_queries,
             "processing_metadata": {
-                "method": "hybrid",
+                "method": "llm-driven",
                 "confidence": enhanced_result.get("confidence", 0.7)
             }
         }

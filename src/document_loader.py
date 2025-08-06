@@ -8,14 +8,15 @@ import filetype
 import pdfplumber
 import PyPDF2
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.schema import Document
 from openai import OpenAI, APIError
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import asyncio
 import io
 import pandas as pd
+import asyncio
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 # Try importing specialized libraries, gracefully handle if not installed
 try:
@@ -39,56 +40,83 @@ try:
 except ImportError:
     PYTESSERACT_INSTALLED = False
     logging.warning("pytesseract/pdf2image not installed. OCR for image-based PDFs will not work.")
+    
+# NOTE: Poppler must be installed separately for pdf2image/pytesseract to work.
+# Instructions: https://github.com/oschwartz10612/poppler-windows/releases/
 
 # Dummy config for demonstration, replace with your actual config
 class Config:
-    CHUNK_SIZE = 1000
-    CHUNK_OVERLAP = 200
-    OPENAI_API_KEY = "YOUR_API_KEY"  # <-- REMINDER: FIX THIS API KEY!
+    CHUNK_SIZE = 1200
+    CHUNK_OVERLAP = 300
+    OPENAI_API_KEY = "YOUR_API_KEY"
     DOCUMENTS_PATH = "./documents"
 
 config = Config()
 
 logger = logging.getLogger(__name__)
 
+# --- Standalone helper functions for threading ---
+# These functions now directly perform the I/O-bound task.
+
+def _thread_process_pdf_page_with_pdfplumber(file_path: str, page_num: int) -> str:
+    """Helper function to extract text from a single PDF page using pdfplumber."""
+    try:
+        with pdfplumber.open(file_path) as pdf:
+            page = pdf.pages[page_num]
+            page_text = page.extract_text()
+            return page_text if page_text else ""
+    except Exception as e:
+        logger.warning(f"pdfplumber extraction failed for page {page_num} of {file_path}: {e}")
+        return ""
+
+def _thread_process_pdf_page_with_pypdf2(file_path: str, page_num: int) -> str:
+    """Helper function to extract text from a single PDF page using PyPDF2."""
+    try:
+        with open(file_path, 'rb') as file:
+            reader = PyPDF2.PdfReader(file)
+            page = reader.pages[page_num]
+            page_text = page.extract_text()
+            return page_text if page_text else ""
+    except Exception as e:
+        logger.warning(f"PyPDF2 extraction failed for page {page_num} of {file_path}: {e}")
+        return ""
+
+# --- DocumentLoader Class ---
+
 class DocumentLoader:
     """
     A universal and highly robust DocumentLoader.
-    It uses a multi-strategy approach to parse documents of any type, including tables,
-    and enriches them with intelligent metadata for superior retrieval.
+    This class is responsible for loading various document types, extracting content,
+    and creating structured chunks for downstream processing.
+    It leverages ThreadPoolExecutor for concurrent I/O operations to improve performance.
     """
     def __init__(self):
-        # Enhanced chunking strategy for policy documents
         self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1200,  # Increased to preserve complete definitions
-            chunk_overlap=300,  # Increased overlap to maintain context
-            separators=[
-                "\n\n\n",  # Major section breaks
-                "\n\n",    # Paragraph breaks
-                "\n",      # Line breaks
-                ". ",      # Sentence breaks
-                "; ",      # Clause breaks
-                ", ",      # Phrase breaks
-                " ",       # Word breaks
-                ""
-            ]
+            chunk_size=config.CHUNK_SIZE,
+            chunk_overlap=config.CHUNK_OVERLAP,
+            separators=["\n\n\n", "\n\n", "\n", ". ", "; ", ", ", " ", ""]
         )
         self.supported_formats = {'.pdf', '.docx', '.doc', '.eml', '.msg', '.txt', '.csv', '.html', '.json', '.xlsx'}
         self.llm_client = OpenAI(api_key=config.OPENAI_API_KEY)
+        # Use a ThreadPoolExecutor for I/O-bound tasks
+        self._executor = ThreadPoolExecutor(max_workers=os.cpu_count() or 6)
 
+    def __del__(self):
+        """Ensure the executor is shut down when the object is destroyed."""
+        if hasattr(self, '_executor') and self._executor:
+            self._executor.shutdown(wait=True) # wait=True to ensure all tasks are finished
+    
     async def process_document_async(self, file_path: str) -> List[Document]:
         """
-        Main async method to process any document type.
+        Async wrapper for the main document processing method.
+        This allows the FastAPI endpoint to not block while processing.
         """
         return await asyncio.to_thread(self.process_document, file_path)
     
     def process_document(self, file_path: str) -> List[Document]:
         """
-        Main method to process any document type.
-        It uses a fallback approach:
-        1. Try native format loaders.
-        2. If that fails, try a generic unstructured parser.
-        3. If tables are detected, they are processed separately.
+        Main method to process a single document.
+        It uses a fallback approach to extract text, then structures and chunks the content.
         """
         logger.info(f"Processing document: {file_path}")
         file_format = self._detect_format(file_path)
@@ -98,8 +126,7 @@ class DocumentLoader:
 
         try:
             if file_format == '.pdf':
-                text = self.load_pdf(file_path)
-                tables_data = self._extract_tables_from_pdf(file_path)
+                text, tables_data = self.load_pdf(file_path)
             elif file_format == '.docx':
                 text = self.load_docx(file_path)
             elif file_format in ['.eml', '.msg']:
@@ -115,6 +142,7 @@ class DocumentLoader:
 
         document_name = Path(file_path).stem
         
+        # Use LLM-based structuring only for smaller, prose-heavy documents
         prose_sections = self._llm_based_document_structuring(text) if text else []
         
         all_sections = prose_sections + tables_data
@@ -130,50 +158,54 @@ class DocumentLoader:
             return Path(file_path).suffix.lower()
 
     # --- Text Extraction Methods (Multiple Fallbacks) ---
-    def load_pdf(self, file_path: str) -> str:
-        text = self._extract_with_pdfplumber(file_path)
-        if not text.strip():
-            logger.info("pdfplumber failed. Falling back to PyPDF2.")
-            text = self._extract_with_pypdf2(file_path)
-        if not text.strip() and PYTESSERACT_INSTALLED:
-            logger.info("PyPDF2 failed. Falling back to OCR.")
-            text = self._extract_with_ocr(file_path)
-        return self._clean_text(text)
-
-    def _extract_with_pdfplumber(self, file_path: str) -> str:
+    def load_pdf(self, file_path: str) -> Tuple[str, List[Dict[str, Any]]]:
+        """
+        Extracts text from PDF with threading for better performance.
+        This method uses ThreadPoolExecutor to handle concurrent I/O.
+        """
         text = ""
+        tables_data = []
+        
         try:
             with pdfplumber.open(file_path) as pdf:
-                for page in pdf.pages:
-                    page_text = page.extract_text()
-                    if page_text:
-                        text += page_text + "\n"
-        except Exception as e:
-            logger.warning(f"pdfplumber extraction failed: {e}")
-        return text
+                pages_count = len(pdf.pages)
+            
+            logger.info(f"Processing {pages_count} pages from {file_path} with threading.")
+            
+            # Prepare the arguments for the helper function
+            pages_to_process = [(file_path, i) for i in range(pages_count)]
+            
+            # Use executor.map for a clean, parallel execution of the helper function
+            texts = list(self._executor.map(_thread_process_pdf_page_with_pdfplumber, *zip(*pages_to_process)))
+            
+            text = "\n".join(texts)
+            
+            # Table extraction remains sequential
+            tables_data = self._extract_tables_from_pdf(file_path)
+            return self._clean_text(text), tables_data
 
-    def _extract_with_pypdf2(self, file_path: str) -> str:
-        text = ""
-        try:
-            with open(file_path, 'rb') as file:
-                reader = PyPDF2.PdfReader(file)
-                for page in reader.pages:
-                    if page.extract_text():
-                        text += page.extract_text() + "\n"
         except Exception as e:
-            logger.warning(f"PyPDF2 extraction failed: {e}")
-        return text
-
-    def _extract_with_ocr(self, file_path: str) -> str:
-        if not PYTESSERACT_INSTALLED:
-            return ""
-        try:
-            images = convert_from_path(file_path)
-            return "\n".join([pytesseract.image_to_string(img) for img in images])
-        except Exception as e:
-            logger.warning(f"OCR failed for {file_path}: {e}")
-            return ""
-
+            logger.warning(f"Threaded pdfplumber extraction failed: {e}. Falling back to single-threaded PyPDF2.")
+            try:
+                with open(file_path, 'rb') as file:
+                    reader = PyPDF2.PdfReader(file)
+                    pages_count = len(reader.pages)
+                
+                # Use a sequential loop for the fallback
+                texts = []
+                for i in range(pages_count):
+                    page_text = _thread_process_pdf_page_with_pypdf2(file_path, i)
+                    texts.append(page_text)
+                
+                text = "\n".join(texts)
+                return self._clean_text(text), tables_data
+            except Exception as e2:
+                logger.warning(f"PyPDF2 sequential extraction failed: {e2}. Falling back to OCR.")
+                if PYTESSERACT_INSTALLED:
+                    logger.info("Falling back to OCR.")
+                    text = self._extract_with_ocr(file_path)
+                return self._clean_text(text), tables_data
+    
     def load_docx(self, file_path: str) -> str:
         doc = docx.Document(file_path)
         text = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
@@ -209,21 +241,28 @@ class DocumentLoader:
         except Exception as e:
             logger.warning(f"Unstructured failed for {file_path}: {e}")
             return ""
-    
+
+    def _extract_with_ocr(self, file_path: str) -> str:
+        if not PYTESSERACT_INSTALLED:
+            return ""
+        try:
+            images = convert_from_path(file_path)
+            return "\n".join([pytesseract.image_to_string(img) for img in images])
+        except Exception as e:
+            logger.warning(f"OCR failed for {file_path}: {e}")
+            return ""
+
     def _clean_text(self, text: str) -> str:
         return ' '.join(text.replace('\x00', '').split())
 
     def _llm_based_document_structuring(self, text: str) -> List[Dict[str, Any]]:
-        # Increased context limit to preserve more document content
-        context_limit = 40000  # Increased from 15000 to 40000 for better coverage
-        
-        if len(text) > context_limit:
-            # For very large documents, use simpler chunking to avoid losing content
+        # For very large documents, use simpler chunking to avoid expensive LLM calls and context limits
+        if len(text) > 40000:
             logger.info(f"Large document ({len(text)} chars), using enhanced chunking instead of LLM structuring")
+            # Fallback to the reliable RecursiveCharacterTextSplitter for large documents
             return self._create_enhanced_chunks_from_text(text)
         
-        # For smaller documents, use LLM structuring but with no truncation
-
+        # For smaller documents, use LLM structuring
         prompt = f"""
         You are a document parser. Break the following text into logical sections.
         For each section, provide a concise 'section_id', the full 'content', and a 'type' from [definition, benefit, exclusion, condition, general].
@@ -259,46 +298,18 @@ class DocumentLoader:
     
     def _create_enhanced_chunks_from_text(self, text: str) -> List[Dict[str, Any]]:
         """
-        Create enhanced chunks from large documents without losing content.
-        Uses semantic boundaries and preserves complete sections.
+        Create enhanced chunks from large documents using a reliable text splitter.
+        This function now correctly and reliably splits large text chunks.
         """
-        # Split by major section indicators first
-        major_sections = []
-        current_section = ""
-        
-        lines = text.split('\n')
-        section_indicators = ['SECTION', 'CHAPTER', 'PART', 'ARTICLE', 'CLAUSE', 'DEFINITION', 'BENEFIT', 'EXCLUSION', 'CONDITION']
-        
-        for line in lines:
-            line_upper = line.upper().strip()
-            is_section_start = any(indicator in line_upper for indicator in section_indicators)
-            
-            if is_section_start and current_section.strip():
-                # Save previous section
-                major_sections.append(current_section.strip())
-                current_section = line + '\n'
-            else:
-                current_section += line + '\n'
-        
-        # Add the last section
-        if current_section.strip():
-            major_sections.append(current_section.strip())
-        
-        # If no major sections found, split by paragraphs
-        if len(major_sections) <= 1:
-            major_sections = [section.strip() for section in text.split('\n\n') if section.strip()]
-        
-        # Convert to document sections
+        chunks = self.text_splitter.split_text(text)
         sections = []
-        for i, section_text in enumerate(major_sections):
-            if len(section_text) > 100:  # Only include substantial sections
-                sections.append({
-                    "section_id": f"SECTION_{i+1}",
-                    "content": section_text,
-                    "type": "general"
-                })
-        
-        return sections if sections else [{"section_id": "FULL_DOCUMENT", "content": text, "type": "general"}]
+        for i, chunk in enumerate(chunks):
+            sections.append({
+                "section_id": f"CHUNK_{i+1}",
+                "content": chunk,
+                "type": "general"
+            })
+        return sections
 
     def _extract_tables_from_pdf(self, file_path: str) -> List[Dict[str, Any]]:
         tables = []
@@ -374,11 +385,9 @@ class DocumentLoader:
             if section_type == 'table' and 'content' in section and isinstance(section['content'], list):
                 table_rows = section['content']
                 for i, row_data in enumerate(table_rows):
-                    # Generic table-to-prose conversion for any table structure
                     if not row_data or not isinstance(row_data, dict):
                         continue
                     
-                    # Find the primary identifier column (first non-empty column)
                     primary_key = None
                     primary_value = None
                     
@@ -391,7 +400,6 @@ class DocumentLoader:
                     if not primary_key or not primary_value:
                         continue
                     
-                    # Collect all other meaningful data columns
                     data_pairs = []
                     for key, value in row_data.items():
                         if key != primary_key and value and str(value).strip():
@@ -400,16 +408,14 @@ class DocumentLoader:
                             if clean_value.lower() not in ['', 'na', 'n/a', 'null', 'none']:
                                 data_pairs.append((clean_key, clean_value))
                     
-                    # Skip if no meaningful data beyond the primary identifier
                     if not data_pairs:
                         continue
                     
-                    # Clean the primary identifier
                     clean_primary = self._clean_text_content(primary_value)
                     if not clean_primary:
                         continue
                     
-                    # Generate natural language content
+                    # Corrected logic: Generate prose from table data for hashing
                     row_content = self._generate_table_prose(clean_primary, data_pairs)
                     
                     if not row_content:
@@ -431,7 +437,6 @@ class DocumentLoader:
                 if not content:
                     continue
                 
-                # Enhanced chunking with definition preservation
                 chunks = self._smart_chunk_with_definitions(content)
 
                 for i, chunk in enumerate(chunks):
@@ -450,7 +455,6 @@ class DocumentLoader:
         if not content.strip():
             return []
         
-        # First, identify and preserve complete definitions
         definition_patterns = [
             r'(\d+\.\d+\s+[A-Z][^\n]*?\s+means\s+[^\n]*?(?:\n[^\n]*?)*?)(?=\n\n|\n\d+\.\d+|$)',
             r'([A-Z][^\n]*?\s+means\s+[^\n]*?(?:\n[^\n]*?)*?)(?=\n\n|\n[A-Z][^\n]*?\s+means|$)',
@@ -461,29 +465,22 @@ class DocumentLoader:
         preserved_definitions = []
         remaining_content = content
         
-        # Extract complete definitions first
         for pattern in definition_patterns:
             matches = re.finditer(pattern, remaining_content, re.MULTILINE | re.DOTALL)
             for match in matches:
                 definition_text = match.group(1).strip()
-                if len(definition_text) > 50:  # Only preserve substantial definitions
+                if len(definition_text) > 50:
                     preserved_definitions.append(definition_text)
-                    # Remove from remaining content to avoid duplication
                     remaining_content = remaining_content.replace(match.group(0), '', 1)
         
-        # Clean up remaining content
         remaining_content = re.sub(r'\n\s*\n\s*\n', '\n\n', remaining_content).strip()
         
-        # Chunk the remaining content normally
         regular_chunks = self.text_splitter.split_text(remaining_content) if remaining_content else []
         
-        # Combine preserved definitions with regular chunks
         all_chunks = preserved_definitions + regular_chunks
         
-        # Filter out empty or very short chunks
         final_chunks = [chunk.strip() for chunk in all_chunks if chunk.strip() and len(chunk.strip()) > 20]
         
-        # If no chunks were created, fall back to regular splitting
         if not final_chunks:
             final_chunks = self.text_splitter.split_text(content)
         
@@ -493,34 +490,21 @@ class DocumentLoader:
         """Clean and normalize column names for better readability."""
         if not column_name:
             return ''
-        
-        # Remove common prefixes and suffixes
         clean_name = str(column_name).strip()
-        
-        # Remove special characters and normalize
         clean_name = re.sub(r'[*#@$%^&()\[\]{}|\\:;"<>?/~`]', '', clean_name)
         clean_name = re.sub(r'\s+', ' ', clean_name).strip()
-        
-        # Remove common table formatting artifacts
         clean_name = re.sub(r'^(Plans?\s*-\s*|Plan\s*-\s*)', '', clean_name, flags=re.IGNORECASE)
         clean_name = re.sub(r'\s*(Column|Col)\s*\d+', '', clean_name, flags=re.IGNORECASE)
-        
         return clean_name.strip()
     
     def _clean_text_content(self, text: str) -> str:
         """Clean and normalize text content for better readability."""
         if not text:
             return ''
-        
         clean_text = str(text).strip()
-        
-        # Remove excessive punctuation and formatting
         clean_text = re.sub(r'[*#@$%^&()\[\]{}|\\:;"<>?/~`]+', '', clean_text)
         clean_text = re.sub(r'\s+', ' ', clean_text).strip()
-        
-        # Remove parenthetical notes that might be domain-specific
         clean_text = re.sub(r'\s*\([^)]*\)\s*', ' ', clean_text).strip()
-        
         return clean_text
     
     def _generate_table_prose(self, primary_item: str, data_pairs: List[tuple]) -> str:
@@ -528,17 +512,14 @@ class DocumentLoader:
         if not primary_item or not data_pairs:
             return ''
         
-        # Check if all values are the same (common case)
         values = [pair[1] for pair in data_pairs]
         unique_values = list(set(values))
         
         if len(unique_values) == 1:
-            # All columns have the same value - create concise statement
             common_value = unique_values[0]
             if len(data_pairs) == 1:
                 return f"{primary_item}: {common_value}."
             else:
-                # Multiple columns with same value
                 column_names = [pair[0] for pair in data_pairs]
                 if len(column_names) <= 3:
                     columns_text = ', '.join(column_names)
@@ -546,7 +527,6 @@ class DocumentLoader:
                 else:
                     return f"{primary_item}: {common_value} across all categories."
         else:
-            # Different values - create detailed statement
             details = []
             for column_name, value in data_pairs:
                 if column_name and value:
@@ -555,28 +535,31 @@ class DocumentLoader:
             if len(details) <= 3:
                 return f"{primary_item} - " + "; ".join(details) + "."
             else:
-                # Too many details, summarize
                 return f"{primary_item} has varying specifications: " + "; ".join(details[:3]) + f" and {len(details)-3} more."
 
     def load_all_documents(self, directory: str = None) -> List[Document]:
-        if directory is None:
-            directory = config.DOCUMENTS_PATH
-        
+        """
+        Loads all supported documents from a directory and processes them in a single batch.
+        This method will now leverage parallel processing for PDFs.
+        """
+        doc_dir = Path(directory or config.DOCUMENTS_PATH)
+        if not doc_dir.is_dir():
+            logger.error(f"Directory not found: {doc_dir}")
+            return []
+
+        all_files = [str(file) for file in doc_dir.iterdir() if file.suffix.lower() in self.supported_formats]
+        if not all_files:
+            logger.warning(f"No supported documents found in {doc_dir}")
+            return []
+
         all_documents = []
-        file_paths = [f for f in Path(directory).glob("*") if f.suffix.lower() in self.supported_formats]
-
-        if not file_paths:
-            logger.warning(f"No supported files found in {directory}")
-            return all_documents
-
-        with ThreadPoolExecutor(max_workers=os.cpu_count() or 1) as executor:
-            futures = {executor.submit(self.process_document, str(file_path)): file_path for file_path in file_paths}
-            for future in as_completed(futures):
-                file_path = futures[future]
-                try:
-                    documents = future.result()
-                    all_documents.extend(documents)
-                except Exception as e:
-                    logger.error(f"Failed to process {Path(file_path).name}: {e}")
-                    continue
+        for file_path in all_files:
+            try:
+                # The process_document call will now handle parallelization internally for PDFs
+                processed_docs = self.process_document(file_path)
+                all_documents.extend(processed_docs)
+            except Exception as e:
+                logger.error(f"Skipping document due to error: {file_path} - {e}")
+                
+        logger.info(f"Finished processing all documents. Total chunks created: {len(all_documents)}")
         return all_documents

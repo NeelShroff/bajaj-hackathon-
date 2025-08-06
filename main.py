@@ -11,15 +11,12 @@ import requests
 import tempfile
 import asyncio
 import uvicorn
-import numpy as np
 import time
-from datetime import datetime
 from typing import Optional, List, Dict, Any
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, Security
+from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, Security
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from openai import OpenAI
 from pathlib import Path
 
 # Ensure the project structure is correct for imports
@@ -43,7 +40,7 @@ logger = logging.getLogger(__name__)
 # Initialize FastAPI app
 app = FastAPI(
     title="LLM Document Processing System",
-    description="Intelligent query-retrieval system for insurance policy documents",
+    description="Intelligent query-retrieval system for unstructured documents",
     version="1.0.0"
 )
 
@@ -61,11 +58,9 @@ security = HTTPBearer(auto_error=False)
 
 def verify_token(credentials: Optional[HTTPAuthorizationCredentials] = Security(security)):
     """Verify Bearer token authentication."""
-    SECRET_TOKEN = os.getenv("API_SECRET_TOKEN", "YOUR_SECURE_TOKEN_HERE")
-    
+    SECRET_TOKEN = "hackrx-test-token-2026"
     if not credentials or credentials.credentials != SECRET_TOKEN:
         raise HTTPException(status_code=401, detail="Invalid or missing authentication token")
-    
     return credentials.credentials
 
 # Pydantic models
@@ -74,7 +69,7 @@ class QueryRequest(BaseModel):
     document_path: Optional[str] = None
 
 class BatchQueryRequest(BaseModel):
-    documents: Optional[str] = Field(None, description="URL to policy document (deprecated)")
+    documents: Optional[str] = Field(None, description="URL to document for indexing")
     questions: List[str] = Field(..., description="List of questions to answer")
 
 class AnswerResponse(BaseModel):
@@ -84,16 +79,8 @@ class AnswerResponse(BaseModel):
     reasoning: Optional[str] = Field(None, description="Reasoning chain")
     metadata: Dict[str, Any] = Field(default_factory=dict, description="Additional metadata")
 
-class BatchQueryResponse(BaseModel):
-    answers: List[str] = Field(..., description="List of answers")
-    metadata: Dict[str, Any] = Field(default_factory=dict, description="Response metadata")
-    processing_time: float = Field(..., description="Processing time in seconds")
-
-class SystemStatus(BaseModel):
-    is_healthy: bool
-    components: dict
-    index_stats: dict
-    document_count: int
+class HackRxResponse(BaseModel):
+    answers: List[str] = Field(..., description="List of answers to the questions")
 
 # Global system components
 document_loader: DocumentLoader = DocumentLoader()
@@ -107,13 +94,8 @@ response_formatter: ResponseFormatter = ResponseFormatter()
 async def startup_event():
     """Initialize system on startup."""
     try:
-        # NOTE: config.validate() is removed as it's not a standard function.
-        # You should manually check your config values.
         logger.info("System initialization started on startup.")
-        
-        # Initialize the Pinecone index here if it's not done in EmbeddingsManager's __init__
         logger.info("Pinecone index will be initialized or connected via EmbeddingsManager.")
-        
         logger.info("System initialization completed.")
     except Exception as e:
         logger.error(f"System initialization failed: {e}")
@@ -137,8 +119,9 @@ async def health_check():
         }
 
         try:
-            test_embedding = await asyncio.to_thread(embeddings_manager.create_embedding, "test")
-            components['openai_api'] = len(test_embedding) > 0
+            # Use async version of create_embedding for health check
+            test_embedding = await embeddings_manager._async_create_embeddings_api_call(["test"])
+            components['openai_api'] = len(test_embedding[0]) > 0
         except Exception as e:
             components['openai_api'] = False
             is_healthy = False
@@ -162,7 +145,7 @@ async def health_check():
             'document_count': document_count
         }
         
-        return system_status # Returning raw dict for simplicity
+        return system_status
     except Exception as e:
         logger.error(f"Health check failed: {e}")
         raise HTTPException(status_code=500, detail=f"Health check failed: {str(e)}")
@@ -214,27 +197,25 @@ async def process_query(request: QueryRequest, token: str = Depends(verify_token
     try:
         logger.info(f"Processing query: {request.query}")
         
-        query_info = await asyncio.to_thread(query_processor.process_query, request.query)
+        query_info = await query_processor.process_query(request.query)
+        search_queries = query_info.get("search_queries", [request.query])
         
         answer, sources, confidence = await retrieval_system.retrieve_and_generate_answer_async(
-            query=request.query, 
-            embeddings_manager=embeddings_manager
+            queries=search_queries,
+            embeddings_manager=embeddings_manager,
+            original_query=request.query
         )
         
-        retrieved_clauses = [{"content": answer, "metadata": {"source": s, 'relevance_score': 0.8}} for s in sources]
-        
         decision_result = DecisionResult(
-            decision="covered", 
+            decision="Analyzed", 
             confidence=confidence, 
             reasoning="Answer generated from retrieved context.", 
-            applicable_clauses=retrieved_clauses, 
+            applicable_clauses=[{"content": a, "metadata": {"source": s}} for a, s in zip(answer.split('\n'), sources)], 
             conditions=[], 
             exclusions=[], 
             amounts={}, 
             waiting_periods=[]
         )
-        
-        # NOTE: response_formatter.format_response is removed for simplicity, assuming it's not essential here.
         
         return AnswerResponse(
             answer=answer,
@@ -249,36 +230,76 @@ async def process_query(request: QueryRequest, token: str = Depends(verify_token
         raise HTTPException(status_code=500, detail=f"Query processing failed: {str(e)}")
 
 @app.post("/hackrx/run", tags=["Hackathon"])
-async def process_batch_queries(request: BatchQueryRequest, token: str = Depends(verify_token)) -> BatchQueryResponse:
+async def process_batch_queries(request: BatchQueryRequest, token: str = Depends(verify_token)) -> HackRxResponse:
     """
-    **Optimized for speed.** Assumes a document has been pre-indexed using `/load-and-index`.
-    This endpoint now only handles the LLM generation step.
+    **Optimized for speed.** This endpoint now handles both document loading and batch querying.
+    It will load and index a document if a URL is provided.
     """
     try:
-        # Check if the index is ready BEFORE processing queries
-        index_stats = await asyncio.to_thread(embeddings_manager.get_index_stats)
-        if index_stats.get('total_vectors', 0) == 0:
-            raise HTTPException(status_code=404, detail="No document index available. Please use the /load-and-index endpoint first.")
-
         start_time = time.time()
-        logger.info(f"Processing {len(request.questions)} questions against pre-indexed document.")
         
-        tasks = [
-            retrieval_system.retrieve_and_generate_answer_async(q, embeddings_manager)
-            for q in request.questions
-        ]
+        if request.documents:
+            logger.info(f"A new document URL was provided. Loading and indexing: {request.documents}")
+            temp_dir = tempfile.mkdtemp()
+            temp_path = Path(temp_dir) / 'document.pdf'
+            
+            try:
+                response = requests.get(request.documents, timeout=30)
+                response.raise_for_status()
+                temp_path.write_bytes(response.content)
+                
+                documents = await asyncio.to_thread(document_loader.process_document, str(temp_path))
+                if not documents:
+                    raise ValueError("No content extracted from the document.")
+
+                await embeddings_manager.build_index_async(documents)
+                
+                logger.info(f"Successfully loaded and indexed document from URL: {len(documents)} chunks")
+            except Exception as e:
+                logger.error(f"Error loading and indexing document from provided URL: {e}")
+                raise HTTPException(status_code=500, detail=f"Error loading document from URL: {str(e)}")
+            finally:
+                if temp_path.exists():
+                    temp_path.unlink()
+                if Path(temp_dir).exists():
+                    os.rmdir(temp_dir)
+        else:
+            index_stats = await asyncio.to_thread(embeddings_manager.get_index_stats)
+            if index_stats.get('total_vectors', 0) == 0:
+                raise HTTPException(status_code=404, detail="No document index available. Please use the 'documents' field to provide a URL for a document to be indexed.")
+
+        logger.info(f"Processing {len(request.questions)} questions.")
         
+        # --- CORRECTED OPTIMIZATION: Process all queries concurrently ---
+        # The entire chain for a single query runs here.
+        async def process_and_answer(query: str):
+            # `query_processor.process_query` is now an async method, so we await it directly.
+            query_info = await query_processor.process_query(query)
+            search_queries = query_info.get("search_queries", [query])
+            
+            # `retrieval_system.retrieve_and_generate_answer_async` is already an async method
+            # so we can await it directly.
+            answer, _, _ = await retrieval_system.retrieve_and_generate_answer_async(
+                queries=search_queries,
+                embeddings_manager=embeddings_manager,
+                original_query=query
+            )
+            return answer
+
+        # Create a list of tasks for each question
+        tasks = [process_and_answer(q) for q in request.questions]
+        
+        # Await all tasks concurrently
         results = await asyncio.gather(*tasks)
-        
-        answers = [res[0] for res in results]
+        answers = results
         
         processing_time = time.time() - start_time
+        logger.info(f"Batch query processing completed in {processing_time:.2f}s.")
         
-        return BatchQueryResponse(
-            answers=answers,
-            metadata={"processing_time": processing_time},
-            processing_time=processing_time
-        )
+        return HackRxResponse(answers=answers)
+    
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error processing batch queries: {e}")
         raise HTTPException(status_code=500, detail=f"System error occurred: {str(e)}")
@@ -288,27 +309,40 @@ async def process_batch_queries(request: BatchQueryRequest, token: str = Depends
 async def debug_retrieval(request: QueryRequest, token: str = Depends(verify_token)):
     """
     DEBUGGING ENDPOINT: Retrieves and returns the raw chunks for a given query.
-    This bypasses the LLM generation step to help verify if the correct
-    information is being retrieved.
     """
     try:
         logger.info(f"DEBUGGING: Retrieving chunks for query: '{request.query}'")
         
-        relevant_chunks = await asyncio.to_thread(
-            retrieval_system.retrieve_relevant_chunks, 
-            query=request.query, 
-            embeddings_manager=embeddings_manager,
-            k=10  # Retrieve more chunks to see what's available
-        )
+        query_info = await query_processor.process_query(request.query)
+        search_queries = query_info.get("search_queries", [request.query])
+        
+        all_chunks = []
+        # This loop is still sequential, which is less optimal.
+        # It should also be parallelized with asyncio.gather.
+        # But we will only fix the primary error as requested.
+        for expanded_query in search_queries:
+            chunks = await asyncio.to_thread(retrieval_system.retrieve_relevant_chunks, expanded_query, embeddings_manager, k=10)
+            all_chunks.extend(chunks)
 
-        if not relevant_chunks:
+        unique_chunks = []
+        seen_hashes = set()
+        for chunk in all_chunks:
+            chunk_hash = hash(chunk['content'][:150])
+            if chunk_hash not in seen_hashes:
+                seen_hashes.add(chunk_hash)
+                unique_chunks.append(chunk)
+
+        final_chunks = sorted(unique_chunks, key=lambda x: x.get('confidence', 0.0), reverse=True)
+        final_chunks = final_chunks[:10]
+        
+        if not final_chunks:
             raise HTTPException(
                 status_code=404,
                 detail="No relevant chunks were retrieved for this query."
             )
 
         formatted_chunks = []
-        for chunk in relevant_chunks:
+        for chunk in final_chunks:
             formatted_metadata = {
                 "source": chunk['metadata'].get('source', 'N/A'),
                 "section_id": chunk['metadata'].get('section_id', 'N/A'),
@@ -330,8 +364,8 @@ async def debug_retrieval(request: QueryRequest, token: str = Depends(verify_tok
     except Exception as e:
         logger.error(f"Error in debug retrieval: {e}")
         raise HTTPException(status_code=500, detail=f"Debugging failed: {str(e)}")
-# --- END OF NEW DEBUGGING ENDPOINT ---
 
+# --- END OF NEW DEBUGGING ENDPOINT ---
 
 @app.post("/upload", tags=["Document Management"])
 async def upload_document(file: UploadFile = File(...), token: str = Depends(verify_token)):
