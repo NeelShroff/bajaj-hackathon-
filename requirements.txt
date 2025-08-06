@@ -1,6 +1,7 @@
-# Core dependencies
+# Core Web Framework
 fastapi>=0.104.1,<1.0.0
-uvicorn>=0.24.0,<1.0.0
+uvicorn[standard]>=0.24.0,<1.0.0
+gunicorn>=21.2.0,<22.0.0
 python-multipart>=0.0.6,<1.0.0
 python-dotenv>=1.0.0,<2.0.0
 
@@ -18,19 +19,30 @@ numpy>=1.24.3,<2.0.0
 PyPDF2>=3.0.1,<4.0.0
 pdfplumber>=0.10.3,<1.0.0
 python-docx>=0.8.11,<1.0.0
+filetype>=1.2.0,<2.0.0
 
-# Data processing
+# Data processing and utilities
 pandas>=2.0.3,<3.0.0
 requests>=2.31.0,<3.0.0
 
-# Authentication (optional)
+# Email processing
+email-validator>=2.0.0,<3.0.0
+
+# Authentication and Security
 python-jose[cryptography]>=3.3.0,<4.0.0
 passlib[bcrypt]>=1.7.4,<2.0.0
 
-# Pydantic
+# Data validation
 pydantic>=2.5.0,<3.0.0
 
-# Build dependencies (included for reference, not installed by default)
-# setuptools>=65.5.1
-# wheel>=0.40.0
-# Cython>=0.29.33
+# Async support
+aiofiles>=23.0.0,<24.0.0
+
+# Logging and monitoring
+structlog>=23.0.0,<24.0.0
+
+# Optional: Advanced document processing (commented out to reduce build time)
+# camelot-py[cv]>=0.10.1,<1.0.0
+# unstructured>=0.10.0,<1.0.0
+# pytesseract>=0.3.10,<1.0.0
+# pdf2image>=3.1.0,<4.0.0
