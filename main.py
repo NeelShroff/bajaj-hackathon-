@@ -58,7 +58,7 @@ security = HTTPBearer(auto_error=False)
 
 def verify_token(credentials: Optional[HTTPAuthorizationCredentials] = Security(security)):
     """Verify Bearer token authentication."""
-    SECRET_TOKEN = "hackrx-test-token-2026"
+    SECRET_TOKEN = "f9e29d7edca43a3e09b4f1c925d7efed93cc349767454bfbb423db67e29741b2"
     if not credentials or credentials.credentials != SECRET_TOKEN:
         raise HTTPException(status_code=401, detail="Invalid or missing authentication token")
     return credentials.credentials
@@ -229,7 +229,7 @@ async def process_query(request: QueryRequest, token: str = Depends(verify_token
         logger.error(f"Error processing query: {e}")
         raise HTTPException(status_code=500, detail=f"Query processing failed: {str(e)}")
 
-@app.post("/hackrx/run", tags=["Hackathon"])
+@app.post("/api/v1/hackrx/run", tags=["Hackathon"])
 async def process_batch_queries(request: BatchQueryRequest, token: str = Depends(verify_token)) -> HackRxResponse:
     """
     **Optimized for speed.** This endpoint now handles both document loading and batch querying.
